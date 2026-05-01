@@ -265,9 +265,12 @@ async function runTransition(
       record.participants,
       schema,
     )
-    const drafts = await computePostings(
+    // Postings come from one of two sources:
+    //   - a user-supplied function (regular transitions)
+    //   - an `invert:<name>` reference (reversal transitions): load
+    //     the original transition's postings and flip every direction
+    const postingsResolution = await resolvePostingsForTransition({
       transitionDef,
-      txnDef,
       tx,
       tenantId,
       record,
@@ -275,11 +278,12 @@ async function runTransition(
       participantHandles,
       occurredAt,
       transitionId,
-      input.traceId,
-    )
+      ...(input.traceId !== undefined ? { traceId: input.traceId } : {}),
+    })
+    const resolvedPostings = postingsResolution.postings
+    const reverses = postingsResolution.reversesTransitionId
 
-    // ---- 6. Resolve postings to account ids + lock those accounts ----------
-    const resolvedPostings = await resolvePostings(tx, tenantId, drafts)
+    // ---- 6. Lock affected accounts (deterministic id order) ---------------
     await lockAccountsInOrder(
       tx,
       tenantId,
@@ -337,7 +341,7 @@ async function runTransition(
       payload: jsonifyForStorage(data) as CanonicalValue,
       idempotency_key: input.idempotencyKey,
       occurred_at: occurredAt,
-      reverses: null,
+      reverses,
     }
     const rowHash = computeRowHash(hasher, content, prevHash)
     const postingsChecksum = computePostingsChecksum(
@@ -361,7 +365,7 @@ async function runTransition(
         ${transitionDef.to}, ${input.name}, ${record.schemaVersion},
         ${input.by.type}, ${input.by.id}, ${tx.json(jsonifyForStorage(data) as never)},
         ${input.idempotencyKey}, ${input.traceId ?? null},
-        ${prevHash}, ${rowHash}, ${postingsChecksum}, ${null}, ${occurredAt}
+        ${prevHash}, ${rowHash}, ${postingsChecksum}, ${reverses}, ${occurredAt}
       )
     `
 
@@ -684,47 +688,74 @@ type ParticipantHandle = {
   readonly [key: string]: AccountInstanceRef | string
 }
 
-async function computePostings(
-  transitionDef: { postings?: unknown },
-  _txnDef: TransactionDef,
-  _tx: SqlTransaction,
-  tenantId: string,
-  _record: TxnRecord,
-  data: Record<string, unknown>,
-  participants: Readonly<Record<string, ParticipantHandle>>,
-  occurredAt: Date,
-  transitionId: string,
-  traceId: string | undefined,
-): Promise<readonly PostingDraft[]> {
-  const fn = transitionDef.postings
-  if (fn === undefined) return []
-  if (typeof fn === 'string') {
-    // 'invert:<name>' references aren't implemented in M1 — they need
-    // the engine to load the original transition's postings, invert
-    // direction, and re-emit. Lands with reversal transitions.
-    throw new LokiError(
-      `Postings reference "${fn}" is reserved for reversal transitions, which arrive in a later batch.`,
-    )
-  }
-  const ctx = {
-    data,
-    participants: participants as never,
-    tenantId,
-    traceId: traceId ?? '',
-    transitionId,
-    occurredAt,
-  }
-  const drafts = (fn as (c: typeof ctx) => readonly PostingDraft[])(ctx)
-  return drafts
-}
-
 type ResolvedPosting = {
   readonly accountId: string
   readonly direction: 'D' | 'C'
   readonly amount: bigint
 }
 
-async function resolvePostings(
+type PostingsResolution = {
+  readonly postings: readonly ResolvedPosting[]
+  /**
+   * For reversal transitions (`invert:<name>` postings), the id of
+   * the original transition this one undoes — written to the
+   * `txn_transitions.reverses` column.
+   */
+  readonly reversesTransitionId: string | null
+}
+
+type ResolveTransitionPostingsArgs = {
+  readonly transitionDef: { postings?: unknown }
+  readonly tx: SqlTransaction
+  readonly tenantId: string
+  readonly record: TxnRecord
+  readonly data: Record<string, unknown>
+  readonly participantHandles: Readonly<Record<string, ParticipantHandle>>
+  readonly occurredAt: Date
+  readonly transitionId: string
+  readonly traceId?: string
+}
+
+/**
+ * Compute the postings list for a transition, regardless of whether
+ * the schema supplies a function or an `invert:<name>` reference.
+ *
+ *   - Function form: invoke the user fn → drafts → resolve account
+ *     refs to account ids → posting list.
+ *   - Invert form: locate the latest transition on this record whose
+ *     name matches one of the targets, load its postings (which
+ *     already carry account ids), and flip every direction. Returns
+ *     the original transition's id as `reversesTransitionId` so the
+ *     engine writes the `reverses` link.
+ */
+async function resolvePostingsForTransition(
+  args: ResolveTransitionPostingsArgs,
+): Promise<PostingsResolution> {
+  const { transitionDef, tx, tenantId, record, data, participantHandles } = args
+  const fn = transitionDef.postings
+
+  if (fn === undefined) {
+    return { postings: [], reversesTransitionId: null }
+  }
+
+  if (typeof fn === 'string') {
+    return resolveInvertReference(tx, tenantId, record, fn)
+  }
+
+  const ctx = {
+    data,
+    participants: participantHandles as never,
+    tenantId,
+    traceId: args.traceId ?? '',
+    transitionId: args.transitionId,
+    occurredAt: args.occurredAt,
+  }
+  const drafts = (fn as (c: typeof ctx) => readonly PostingDraft[])(ctx)
+  const postings = await resolveDrafts(tx, tenantId, drafts)
+  return { postings, reversesTransitionId: null }
+}
+
+async function resolveDrafts(
   tx: SqlTransaction,
   tenantId: string,
   drafts: readonly PostingDraft[],
@@ -752,6 +783,60 @@ async function resolvePostings(
     out.push({ accountId: acc.id, direction: d.direction, amount: d.amount })
   }
   return out
+}
+
+const INVERT_PREFIX = 'invert:'
+
+async function resolveInvertReference(
+  tx: SqlTransaction,
+  tenantId: string,
+  record: TxnRecord,
+  spec: string,
+): Promise<PostingsResolution> {
+  if (!spec.startsWith(INVERT_PREFIX)) {
+    throw new LokiError(`Unknown postings reference "${spec}".`)
+  }
+  const targets = spec
+    .slice(INVERT_PREFIX.length)
+    .split('|')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+  if (targets.length === 0) {
+    throw new LokiError(`Empty invert target list in "${spec}".`)
+  }
+
+  // Find the latest transition on this record whose name is one of the
+  // declared targets. ULIDs are sortable strings so DESC by id gives us
+  // the most recent.
+  const [original] = await tx<{ id: string }[]>`
+    select id from "txn_transitions"
+    where tenant_id = ${tenantId}
+      and txn_id = ${record.id}
+      and name = any(${targets})
+      and reverses is null
+    order by id desc
+    limit 1
+  `
+  if (!original) {
+    throw new LokiError(
+      `Reversal transition cannot find a non-reversed prior transition on record ${record.id} matching ${JSON.stringify(targets)}.`,
+    )
+  }
+
+  const rows = await tx<{ account_id: string; direction: 'D' | 'C'; amount: string }[]>`
+    select account_id, direction, amount::text as amount
+    from "postings"
+    where transition_id = ${original.id} and tenant_id = ${tenantId}
+  `
+  if (rows.length === 0) {
+    throw new LokiError(`Original transition ${original.id} has no postings to invert.`)
+  }
+  const inverted: ResolvedPosting[] = rows.map((r) => ({
+    accountId: r.account_id,
+    direction: r.direction === 'D' ? ('C' as const) : ('D' as const),
+    amount: BigInt(r.amount),
+  }))
+  return { postings: inverted, reversesTransitionId: original.id }
 }
 
 async function lockAccountsInOrder(

@@ -74,7 +74,16 @@ importers:
       '@loki/core':
         specifier: workspace:*
         version: link:../core
+      '@standard-schema/spec':
+        specifier: 1.0.0
+        version: 1.0.0
     devDependencies:
+      '@testcontainers/postgresql':
+        specifier: ^10.13.2
+        version: 10.28.0
+      testcontainers:
+        specifier: ^10.13.2
+        version: 10.28.0
       tsup:
         specifier: ^8.3.5
         version: 8.5.1(postcss@8.5.13)(typescript@5.9.3)(yaml@2.8.3)

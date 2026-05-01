@@ -1,6 +1,21 @@
-// Placeholder — the typed runtime client is generated into a consumer's
-// node_modules during M1. This package will host the runtime shared by
-// every generated client (connection management, base query helpers,
-// session GUC handling, prepared-statement cache).
+// `@loki/client` — typed runtime client.
+//
+// Wraps the generic `engine.forTenant(...).transactions.*` surface in a
+// schema-driven facade where each transaction type gets its own
+// namespace (`client.deliveryPayment.create / transition / get /
+// trace`) with payload types narrowed per transition.
 
 export const CLIENT_PACKAGE = '@loki/client'
+
+export { defineClient } from './define-client.js'
+export type {
+  CreateInput,
+  DataOf,
+  Decapitalize,
+  ParticipantsInput,
+  StatesOf,
+  TransactionClient,
+  TransitionInput,
+  TransitionNames,
+  TypedClient,
+} from './types.js'

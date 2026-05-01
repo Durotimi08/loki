@@ -4,8 +4,6 @@
 
 You declare your transaction shapes, actors, accounts, and rules in a TypeScript schema, and Loki gives you a typed runtime that handles the bookkeeping correctly by construction: idempotency, audit logging, state-transition guards, double-entry invariants, capability gating, multi-tenancy, reconciliation, tamper detection, and adapter-mediated PSP integration.
 
-The full design is in [`project.md`](./project.md). Foundational decisions resolved before M1 are in [`DECISIONS.md`](./DECISIONS.md).
-
 ## Status
 
 Pre-alpha — building toward M1 of the [§18 roadmap](./project.md#18-roadmap). Public APIs will change.
@@ -35,7 +33,7 @@ Reference schemas (`@loki/schemas-*`) and first-party adapters (`@loki/adapter-s
 
 ```sh
 pnpm install
-pnpm test
+pnpm tests
 pnpm typecheck
 pnpm lint
 ```

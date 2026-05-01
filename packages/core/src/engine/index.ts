@@ -15,6 +15,26 @@ export type { CanonicalValue } from './canonical.js'
 export { DEFAULT_SEVERITY, markResolved, recordAnomaly } from './anomalies.js'
 export type { AnomalyDraft } from './anomalies.js'
 
+export { decodeCursor, encodeCursor } from './cursor.js'
+export type { Cursor, Order, Page } from './cursor.js'
+
+export { buildQueryOps } from './queries.js'
+export type {
+  AccountHistoryArgs,
+  AccountQueryOps,
+  ActorScopedOps,
+  ActorSummary,
+  ActorSummaryArgs,
+  ActorTransactionsArgs,
+  AmountFilter,
+  DateLike,
+  FindManyAnomaliesArgs,
+  FindManyPostingsArgs,
+  FindManyTransactionsArgs,
+  FindManyTransitionsArgs,
+  QueryOps,
+} from './queries.js'
+
 export { openConnection } from './connection.js'
 export type { Connection, ConnectionInput, SqlClient, SqlTransaction } from './connection.js'
 
@@ -85,6 +105,7 @@ export type {
   AccountIdentity,
   AccountRow,
   ActorRef,
+  AnomalyRow,
   CreateAccountInput,
   CreateRecordInput,
   CreateRecordResult,

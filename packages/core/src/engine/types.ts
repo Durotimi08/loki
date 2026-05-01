@@ -83,6 +83,21 @@ export type Posting = {
   readonly occurredAt: Date
 }
 
+export type AnomalyRow = {
+  readonly id: string
+  readonly tenantId: string
+  readonly detectedAt: Date
+  readonly check: string
+  readonly txnId: string | null
+  readonly accountId: string | null
+  readonly severity: 'warn' | 'error' | 'critical'
+  readonly expected: unknown
+  readonly observed: unknown
+  readonly resolvedAt: Date | null
+  readonly resolvedBy: string | null
+  readonly resolution: string | null
+}
+
 // =============================================================================
 // Inputs
 // =============================================================================

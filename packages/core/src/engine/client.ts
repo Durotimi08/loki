@@ -3,6 +3,7 @@ import { type AccountOps, buildAccountOps } from './accounts.js'
 import type { Connection } from './connection.js'
 import type { Hasher } from './hash.js'
 import type { HookRegistry } from './hooks.js'
+import { type QueryOps, buildQueryOps } from './queries.js'
 import { type RecordOps, buildRecordOps } from './records.js'
 
 /**
@@ -22,6 +23,8 @@ export type TenantClient = {
   readonly tenantId: string
   readonly accounts: AccountOps
   readonly transactions: RecordOps
+  /** Per-actor / per-account / generic findMany read APIs (§11). */
+  readonly queries: QueryOps
 }
 
 export function buildTenantClient(opts: {
@@ -41,5 +44,6 @@ export function buildTenantClient(opts: {
       hasher: opts.hasher,
       hooks: opts.hooks,
     }),
+    queries: buildQueryOps(opts.tenantId, opts.connection),
   }
 }

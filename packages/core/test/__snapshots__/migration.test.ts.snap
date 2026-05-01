@@ -1,0 +1,388 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`planInitialMigration — Chidori fixture > toDownSql matches the golden snapshot 1`] = `
+"REVOKE ALL ON ALL TABLES IN SCHEMA public FROM "ledger_app";
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM "ledger_admin";
+
+DROP POLICY IF EXISTS "txn_anomalies_tenant_isolation" ON "txn_anomalies";
+
+ALTER TABLE "txn_anomalies" DISABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "outbox_tenant_isolation" ON "outbox";
+
+ALTER TABLE "outbox" DISABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "postings_tenant_isolation" ON "postings";
+
+ALTER TABLE "postings" DISABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "txn_keys_tenant_isolation" ON "txn_keys";
+
+ALTER TABLE "txn_keys" DISABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "txn_transitions_tenant_isolation" ON "txn_transitions";
+
+ALTER TABLE "txn_transitions" DISABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "txn_records_tenant_isolation" ON "txn_records";
+
+ALTER TABLE "txn_records" DISABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "accounts_tenant_isolation" ON "accounts";
+
+ALTER TABLE "accounts" DISABLE ROW LEVEL SECURITY;
+
+DROP INDEX IF EXISTS "txn_anomalies_severity_idx";
+
+DROP INDEX IF EXISTS "outbox_drain_idx";
+
+DROP INDEX IF EXISTS "txn_keys_active_idx";
+
+DROP INDEX IF EXISTS "postings_transition_idx";
+
+DROP INDEX IF EXISTS "postings_account_history_idx";
+
+DROP INDEX IF EXISTS "txn_transitions_actor_idx";
+
+DROP INDEX IF EXISTS "txn_transitions_trace_idx";
+
+DROP INDEX IF EXISTS "txn_records_creator_idx";
+
+DROP INDEX IF EXISTS "txn_records_type_state_idx";
+
+DROP TABLE IF EXISTS "txn_anomalies";
+
+DROP TABLE IF EXISTS "outbox";
+
+DROP TABLE IF EXISTS "postings";
+
+DROP TABLE IF EXISTS "txn_keys";
+
+DROP TABLE IF EXISTS "txn_transitions";
+
+DROP TABLE IF EXISTS "txn_records";
+
+DROP TABLE IF EXISTS "accounts";
+
+DROP TABLE IF EXISTS "tenants";
+
+"
+`;
+
+exports[`planInitialMigration — Chidori fixture > toUpSql matches the golden snapshot 1`] = `
+"DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ledger_app') THEN
+    CREATE ROLE "ledger_app" NOLOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ledger_admin') THEN
+    CREATE ROLE "ledger_admin" NOLOGIN;
+  END IF;
+END
+$$;
+
+CREATE TABLE "tenants" (
+  "id"         text PRIMARY KEY,
+  "name"       text NOT NULL,
+  "mode"       text NOT NULL CHECK ("mode" IN ('db', 'schema', 'row')),
+  "state"      text NOT NULL CHECK ("state" IN ('active', 'suspended', 'deleted')),
+  "created_at" timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE "accounts" (
+  "id"                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  "tenant_id"           text NOT NULL REFERENCES "tenants"("id") ON DELETE RESTRICT,
+  "owner_actor_type"    text NOT NULL,
+  "owner_actor_id"      text NOT NULL,
+  "name"                text NOT NULL,
+  "parent_account_id"   uuid REFERENCES "accounts"("id") ON DELETE RESTRICT,
+  "shard_index"         int NOT NULL DEFAULT 0 CHECK ("shard_index" >= 0),
+  "currency"            text NOT NULL CHECK (length("currency") > 0),
+  "balance"             numeric(38,0) NOT NULL DEFAULT 0,
+  "created_at"          timestamptz NOT NULL DEFAULT now(),
+  CHECK ("owner_actor_type" IN ('User', 'Driver', 'Company')),
+  CHECK (("owner_actor_type" = 'User' AND "name" IN ('wallet'))
+      OR ("owner_actor_type" = 'Driver' AND "name" IN ('balance'))
+      OR ("owner_actor_type" = 'Company' AND "name" IN ('revenue', 'promo_pool', 'escrow', 'chargebacks'))),
+  UNIQUE ("tenant_id", "owner_actor_type", "owner_actor_id", "name", "currency", "shard_index")
+);
+
+CREATE TABLE "txn_records" (
+  "id"                      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  "tenant_id"               text NOT NULL REFERENCES "tenants"("id") ON DELETE RESTRICT,
+  "type"                    text NOT NULL,
+  "state"                   text NOT NULL,
+  "version"                 int NOT NULL DEFAULT 0,
+  "active_keys"             jsonb NOT NULL DEFAULT '[]'::jsonb,
+  "created_by_actor_type"   text NOT NULL,
+  "created_by_actor_id"     text NOT NULL,
+  "compromised"             boolean NOT NULL DEFAULT FALSE,
+  "schema_version"          int NOT NULL DEFAULT 1,
+  "created_at"              timestamptz NOT NULL DEFAULT now(),
+  "updated_at"              timestamptz NOT NULL DEFAULT now(),
+  CHECK ("type" IN ('DeliveryPayment')),
+  CHECK (
+         ("type" = 'DeliveryPayment' AND "state" IN ('pending', 'completed', 'failed', 'refunded'))
+       )
+);
+
+CREATE TABLE "txn_transitions" (
+  "id"                  text PRIMARY KEY CHECK (length("id") = 26),
+  "tenant_id"           text NOT NULL REFERENCES "tenants"("id") ON DELETE RESTRICT,
+  "txn_id"              uuid NOT NULL REFERENCES "txn_records"("id") ON DELETE RESTRICT,
+  "type"                text NOT NULL,
+  "from_state"          text,
+  "to_state"            text NOT NULL,
+  "name"                text NOT NULL,
+  "schema_version"      int NOT NULL DEFAULT 1,
+  "actor_type"          text NOT NULL,
+  "actor_id"            text NOT NULL,
+  "payload"             jsonb NOT NULL DEFAULT '{}'::jsonb,
+  "idempotency_key"     text NOT NULL,
+  "trace_id"            text,
+  "prev_hash"           bytea,
+  "row_hash"            bytea NOT NULL,
+  "postings_checksum"   bytea NOT NULL,
+  "reverses"            text REFERENCES "txn_transitions"("id") ON DELETE RESTRICT,
+  "occurred_at"         timestamptz NOT NULL DEFAULT now(),
+  CHECK (
+         ("type" = 'DeliveryPayment' AND "name" IN ('pay', 'cancel', 'refund'))
+       ),
+  CHECK (
+         ("type" = 'DeliveryPayment' AND ("from_state" IN ('pending', 'completed')))
+       ),
+  CHECK (
+         ("type" = 'DeliveryPayment' AND "to_state" IN ('completed', 'failed', 'refunded'))
+       ),
+  UNIQUE ("tenant_id", "txn_id", "idempotency_key")
+);
+
+CREATE TABLE "txn_keys" (
+  "id"                          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  "tenant_id"                   text NOT NULL REFERENCES "tenants"("id") ON DELETE RESTRICT,
+  "txn_id"                      uuid NOT NULL REFERENCES "txn_records"("id") ON DELETE RESTRICT,
+  "name"                        text NOT NULL,
+  "granted_by_transition_id"    text NOT NULL REFERENCES "txn_transitions"("id") ON DELETE RESTRICT,
+  "consumed_by_transition_id"   text REFERENCES "txn_transitions"("id") ON DELETE RESTRICT,
+  "expires_at"                  timestamptz,
+  "status"                      text NOT NULL CHECK ("status" IN ('active', 'consumed', 'expired')),
+  CHECK ("name" IN ('refund'))
+);
+
+CREATE TABLE "postings" (
+  "id"              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  "tenant_id"       text NOT NULL REFERENCES "tenants"("id") ON DELETE RESTRICT,
+  "transition_id"   text NOT NULL REFERENCES "txn_transitions"("id") ON DELETE RESTRICT,
+  "account_id"      uuid NOT NULL REFERENCES "accounts"("id") ON DELETE RESTRICT,
+  "amount"          numeric(38,0) NOT NULL CHECK ("amount" >= 0),
+  "direction"       text NOT NULL CHECK ("direction" IN ('D', 'C')),
+  "occurred_at"     timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE "outbox" (
+  "id"                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  "tenant_id"           text NOT NULL REFERENCES "tenants"("id") ON DELETE RESTRICT,
+  "txn_id"              uuid NOT NULL REFERENCES "txn_records"("id") ON DELETE RESTRICT,
+  "transition_id"       text NOT NULL REFERENCES "txn_transitions"("id") ON DELETE RESTRICT,
+  "event"               text NOT NULL,
+  "intent"              text,
+  "payload"             jsonb NOT NULL DEFAULT '{}'::jsonb,
+  "delivered_at"        timestamptz,
+  "attempts"            int NOT NULL DEFAULT 0,
+  "next_attempt_at"     timestamptz NOT NULL DEFAULT now(),
+  "last_error"          text,
+  CHECK ("event" IN ('delivery.paid', 'delivery.cancelled', 'delivery.refunded'))
+);
+
+CREATE TABLE "txn_anomalies" (
+  "id"              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  "tenant_id"       text NOT NULL REFERENCES "tenants"("id") ON DELETE RESTRICT,
+  "detected_at"     timestamptz NOT NULL DEFAULT now(),
+  "check_name"      text NOT NULL,
+  "txn_id"          uuid REFERENCES "txn_records"("id") ON DELETE RESTRICT,
+  "account_id"      uuid REFERENCES "accounts"("id") ON DELETE RESTRICT,
+  "expected"        jsonb,
+  "observed"        jsonb,
+  "severity"        text NOT NULL CHECK ("severity" IN ('warn', 'error', 'critical')),
+  "resolved_at"     timestamptz,
+  "resolved_by"     text,
+  "resolution"      text
+);
+
+CREATE INDEX "txn_records_type_state_idx"
+  ON "txn_records" (
+    "tenant_id",
+    "type",
+    "state",
+    "updated_at" DESC
+  );
+
+CREATE INDEX "txn_records_creator_idx"
+  ON "txn_records" (
+    "tenant_id",
+    "created_by_actor_type",
+    "created_by_actor_id",
+    "updated_at" DESC
+  );
+
+CREATE INDEX "txn_transitions_trace_idx"
+  ON "txn_transitions" (
+    "tenant_id",
+    "txn_id",
+    "id" ASC
+  );
+
+CREATE INDEX "txn_transitions_actor_idx"
+  ON "txn_transitions" (
+    "tenant_id",
+    "actor_type",
+    "actor_id",
+    "occurred_at" DESC,
+    "id" DESC
+  );
+
+CREATE INDEX "postings_account_history_idx"
+  ON "postings" (
+    "tenant_id",
+    "account_id",
+    "occurred_at" DESC,
+    "id" DESC
+  );
+
+CREATE INDEX "postings_transition_idx"
+  ON "postings" (
+    "tenant_id",
+    "transition_id"
+  );
+
+CREATE INDEX "txn_keys_active_idx"
+  ON "txn_keys" (
+    "tenant_id",
+    "txn_id",
+    "name"
+  )
+  WHERE "status" = 'active';
+
+CREATE INDEX "outbox_drain_idx"
+  ON "outbox" (
+    "tenant_id",
+    "next_attempt_at",
+    "id"
+  )
+  WHERE "delivered_at" IS NULL;
+
+CREATE INDEX "txn_anomalies_severity_idx"
+  ON "txn_anomalies" (
+    "tenant_id",
+    "severity",
+    "detected_at" DESC
+  );
+
+ALTER TABLE "accounts" ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE "accounts" FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY "accounts_tenant_isolation" ON "accounts"
+  USING ("tenant_id" = current_setting('loki.tenant_id', true))
+  WITH CHECK ("tenant_id" = current_setting('loki.tenant_id', true));
+
+ALTER TABLE "txn_records" ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE "txn_records" FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY "txn_records_tenant_isolation" ON "txn_records"
+  USING ("tenant_id" = current_setting('loki.tenant_id', true))
+  WITH CHECK ("tenant_id" = current_setting('loki.tenant_id', true));
+
+ALTER TABLE "txn_transitions" ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE "txn_transitions" FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY "txn_transitions_tenant_isolation" ON "txn_transitions"
+  USING ("tenant_id" = current_setting('loki.tenant_id', true))
+  WITH CHECK ("tenant_id" = current_setting('loki.tenant_id', true));
+
+ALTER TABLE "txn_keys" ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE "txn_keys" FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY "txn_keys_tenant_isolation" ON "txn_keys"
+  USING ("tenant_id" = current_setting('loki.tenant_id', true))
+  WITH CHECK ("tenant_id" = current_setting('loki.tenant_id', true));
+
+ALTER TABLE "postings" ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE "postings" FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY "postings_tenant_isolation" ON "postings"
+  USING ("tenant_id" = current_setting('loki.tenant_id', true))
+  WITH CHECK ("tenant_id" = current_setting('loki.tenant_id', true));
+
+ALTER TABLE "outbox" ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE "outbox" FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY "outbox_tenant_isolation" ON "outbox"
+  USING ("tenant_id" = current_setting('loki.tenant_id', true))
+  WITH CHECK ("tenant_id" = current_setting('loki.tenant_id', true));
+
+ALTER TABLE "txn_anomalies" ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE "txn_anomalies" FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY "txn_anomalies_tenant_isolation" ON "txn_anomalies"
+  USING ("tenant_id" = current_setting('loki.tenant_id', true))
+  WITH CHECK ("tenant_id" = current_setting('loki.tenant_id', true));
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON
+  "tenants",
+  "accounts",
+  "txn_records",
+  "txn_transitions",
+  "txn_keys",
+  "postings",
+  "outbox",
+  "txn_anomalies"
+TO "ledger_admin";
+
+GRANT SELECT ON
+  "tenants",
+  "accounts",
+  "txn_records",
+  "txn_transitions",
+  "txn_keys",
+  "postings",
+  "outbox",
+  "txn_anomalies"
+TO "ledger_app";
+
+GRANT INSERT ON "txn_transitions" TO "ledger_app";
+
+GRANT INSERT ON "postings" TO "ledger_app";
+
+GRANT INSERT ON "outbox" TO "ledger_app";
+
+GRANT INSERT ON "txn_anomalies" TO "ledger_app";
+
+GRANT INSERT ON "accounts" TO "ledger_app";
+
+GRANT INSERT ON "txn_records" TO "ledger_app";
+
+GRANT INSERT ON "txn_keys" TO "ledger_app";
+
+GRANT UPDATE ("state", "version", "active_keys", "compromised", "updated_at")
+ON "txn_records" TO "ledger_app";
+
+GRANT UPDATE ("balance") ON "accounts" TO "ledger_app";
+
+GRANT UPDATE ("status", "consumed_by_transition_id")
+ON "txn_keys" TO "ledger_app";
+
+GRANT UPDATE ("delivered_at", "attempts", "next_attempt_at", "last_error")
+ON "outbox" TO "ledger_app";
+
+GRANT UPDATE ("resolved_at", "resolved_by", "resolution")
+ON "txn_anomalies" TO "ledger_app";
+
+"
+`;

@@ -67,5 +67,36 @@ export {
 export type { CurrencyCode } from './primitives/currency.js'
 export { ULID_REGEX, ulid } from './primitives/ulid.js'
 
+// --- DDL / migrations ---
+export {
+  buildDropIndexesSql,
+  buildDropRlsSql,
+  buildDropRolesSql,
+  buildDropTablesSql,
+  buildGrantsSql,
+  buildIndexesSql,
+  buildRlsSql,
+  buildRolesSql,
+  buildTablesSql,
+  DEFAULT_OPTIONS as DEFAULT_MIGRATION_OPTIONS,
+  ENGINE_TABLES,
+  ident,
+  inList,
+  literal,
+  literalString,
+  planInitialMigration,
+  resolveOptions,
+  SqlError,
+  TENANT_GUC,
+  trimSql,
+} from './db/index.js'
+export type {
+  EngineTable,
+  MigrationOptions,
+  MigrationPlan,
+  ResolvedMigrationOptions,
+  TenancyMode,
+} from './db/index.js'
+
 // --- meta ---
 export { LOKI_CORE_VERSION } from './version.js'

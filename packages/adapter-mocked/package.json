@@ -24,6 +24,9 @@
     "@loki/core": "workspace:*"
   },
   "devDependencies": {
+    "@standard-schema/spec": "1.0.0",
+    "@testcontainers/postgresql": "^10.13.2",
+    "testcontainers": "^10.13.2",
     "tsup": "^8.3.5",
     "typescript": "^5.6.3"
   },

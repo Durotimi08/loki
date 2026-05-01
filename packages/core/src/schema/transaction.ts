@@ -163,6 +163,7 @@ function buildTransition(
     ...(raw.invariant !== undefined ? { invariant: raw.invariant } : {}),
     ...(raw.needs !== undefined ? { needs: raw.needs } : {}),
     ...(raw.emit !== undefined ? { emit: raw.emit } : {}),
+    ...(raw.intent !== undefined ? { intent: raw.intent } : {}),
   }
   return def
 }

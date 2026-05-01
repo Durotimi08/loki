@@ -9,6 +9,12 @@ import type { HookRegistry, OutboxFailureTerminalEvent } from './hooks.js'
  * exponential-backoff-and-jitter, and on the final failure marks
  * `failed_at` and fires `onOutboxFailureTerminal`.
  *
+ * The worker takes a `dispatch(event)` function and not a single
+ * `handler` so the engine can intercept events whose `intent` matches
+ * a registered adapter (the adapter calls `confirm`/`fail` which drive
+ * a follow-up transition); only events with no matching adapter fall
+ * through to the consumer-supplied handler.
+ *
  * Tenancy: workers run as admin so they can drain all tenants. RLS on
  * `outbox` would otherwise stand in the way of a multi-tenant worker.
  */
@@ -28,7 +34,12 @@ export type OutboxEvent = {
 export type OutboxHandler = (event: OutboxEvent) => Promise<void> | void
 
 export type OutboxWorkerOptions = {
-  readonly handler: OutboxHandler
+  /**
+   * Fallback handler — invoked for every event that doesn't get routed
+   * to a registered adapter. If the engine has no adapters, every
+   * event hits this handler.
+   */
+  readonly handler?: OutboxHandler
   readonly batchSize?: number
   readonly maxAttempts?: number
   /**
@@ -50,14 +61,22 @@ export type OutboxWorkerHandle = {
   readonly drainOnce: () => Promise<number>
 }
 
+/**
+ * `dispatch` is what the worker calls per claimed event. The engine
+ * wires this to a function that consults its adapter list first; only
+ * events whose `intent` no adapter handles fall through to the
+ * consumer-supplied `handler`.
+ */
+export type OutboxDispatch = (event: OutboxEvent) => Promise<void>
+
 export type OutboxOps = {
   /** Spawn a worker that drains the outbox on an interval. */
-  startWorker(options: OutboxWorkerOptions): OutboxWorkerHandle
+  startWorker(options?: OutboxWorkerOptions): OutboxWorkerHandle
   /**
-   * Drain a single batch immediately and return the number of events
-   * processed. Used by tests and one-shot operators.
+   * Drain a single batch immediately. Returns the number of events
+   * processed.
    */
-  drainOnce(options: Omit<OutboxWorkerOptions, 'intervalMs' | 'onError'>): Promise<number>
+  drainOnce(options?: OutboxWorkerOptions): Promise<number>
 }
 
 const DEFAULT_BATCH_SIZE = 100
@@ -73,17 +92,29 @@ const defaultBackoff = (nextAttempt: number): number => {
   return Math.floor(Math.random() * base)
 }
 
-export function buildOutboxOps(connection: Connection, hooks: HookRegistry): OutboxOps {
+export type BuildOutboxOptions = {
+  readonly connection: Connection
+  readonly hooks: HookRegistry
+  /**
+   * Constructs the dispatch function on every worker start so the
+   * engine can capture the adapter list at startup time.
+   */
+  readonly buildDispatch: (handler: OutboxHandler | undefined) => OutboxDispatch
+}
+
+export function buildOutboxOps(opts: BuildOutboxOptions): OutboxOps {
+  const { connection, hooks, buildDispatch } = opts
   return {
-    startWorker(options) {
+    startWorker(options = {}) {
       let stopped = false
       let inFlight: Promise<unknown> = Promise.resolve()
       const interval = options.intervalMs ?? DEFAULT_INTERVAL_MS
+      const dispatch = buildDispatch(options.handler)
 
       const tick = async (): Promise<void> => {
         if (stopped) return
         try {
-          inFlight = drainBatch(connection, hooks, options)
+          inFlight = drainBatch(connection, hooks, dispatch, options)
           await inFlight
         } catch (e) {
           if (options.onError) options.onError(e)
@@ -103,13 +134,14 @@ export function buildOutboxOps(connection: Connection, hooks: HookRegistry): Out
           await inFlight
         },
         async drainOnce() {
-          return drainBatch(connection, hooks, options)
+          return drainBatch(connection, hooks, dispatch, options)
         },
       }
     },
 
-    async drainOnce(options) {
-      return drainBatch(connection, hooks, options)
+    async drainOnce(options = {}) {
+      const dispatch = buildDispatch(options.handler)
+      return drainBatch(connection, hooks, dispatch, options)
     },
   }
 }
@@ -117,7 +149,8 @@ export function buildOutboxOps(connection: Connection, hooks: HookRegistry): Out
 async function drainBatch(
   connection: Connection,
   hooks: HookRegistry,
-  options: Pick<OutboxWorkerOptions, 'handler' | 'batchSize' | 'maxAttempts' | 'backoff'>,
+  dispatch: OutboxDispatch,
+  options: Pick<OutboxWorkerOptions, 'batchSize' | 'maxAttempts' | 'backoff'>,
 ): Promise<number> {
   const batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE
   const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS
@@ -139,11 +172,10 @@ async function drainBatch(
     return rows.map(mapEvent)
   })
 
-  // Phase 2: invoke the handler per event, then a third phase records
-  // success / failure.
+  // Phase 2: dispatch each event, then a third phase records success / failure.
   for (const ev of claimed) {
     try {
-      await Promise.resolve(options.handler(ev))
+      await dispatch(ev)
       await connection.asAdmin(async (tx) => {
         await tx`
           update "outbox"

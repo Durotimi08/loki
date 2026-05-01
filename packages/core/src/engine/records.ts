@@ -440,12 +440,21 @@ async function runTransition(
     }
 
     // ---- 11. Outbox -------------------------------------------------------
-    if (transitionDef.emit) {
+    // A row is emitted when either `emit` or `intent` is declared. The
+    // `event` column carries the past-tense fan-out name; `intent`
+    // carries the adapter-routing directive. Either may be NULL.
+    if (transitionDef.emit || transitionDef.intent) {
+      const eventName = transitionDef.emit ?? transitionDef.intent ?? null
       await tx`
         insert into "outbox" (
-          tenant_id, txn_id, transition_id, event, payload
+          tenant_id, txn_id, transition_id, event, intent, payload
         ) values (
-          ${tenantId}, ${record.id}, ${transitionId}, ${transitionDef.emit}, ${tx.json(jsonifyForStorage(data) as never)}
+          ${tenantId},
+          ${record.id},
+          ${transitionId},
+          ${eventName},
+          ${transitionDef.intent ?? null},
+          ${tx.json(jsonifyForStorage(data) as never)}
         )
       `
     }

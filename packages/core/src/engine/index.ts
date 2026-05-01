@@ -39,7 +39,7 @@ export { openConnection } from './connection.js'
 export type { Connection, ConnectionInput, SqlClient, SqlTransaction } from './connection.js'
 
 export { createEngine } from './engine.js'
-export type { Engine, EngineOptions } from './engine.js'
+export type { AdaptersOps, Engine, EngineOptions } from './engine.js'
 
 export {
   ActorNotPermittedError,
@@ -76,12 +76,21 @@ export type {
 
 export { buildOutboxOps } from './outbox.js'
 export type {
+  OutboxDispatch,
   OutboxEvent,
   OutboxHandler,
   OutboxOps,
   OutboxWorkerHandle,
   OutboxWorkerOptions,
 } from './outbox.js'
+
+export type {
+  AdapterContract,
+  AdapterInboundContext,
+  AdapterInboundResult,
+  AdapterOutboundContext,
+  AdapterTransitionAction,
+} from './adapter.js'
 
 export { createReconciler } from './reconciler.js'
 export type {

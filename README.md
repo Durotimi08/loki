@@ -4,18 +4,6 @@
 
 You declare your transaction shapes, actors, accounts, and rules in a TypeScript schema, and Loki gives you a typed runtime that handles the bookkeeping correctly by construction: idempotency, audit logging, state-transition guards, double-entry invariants, capability gating, multi-tenancy, reconciliation, tamper detection, and adapter-mediated PSP integration.
 
-## Status
-
-Pre-alpha — building toward M1 of the [§18 roadmap](./project.md#18-roadmap). Public APIs will change.
-
-| Milestone | Status |
-|-----------|--------|
-| Decisions locked | ✅ |
-| Monorepo + tooling | ✅ |
-| M1 — Schema DSL + types + validation | 🚧 in progress |
-| M1 — Engine, idempotency, runtime client | ⏳ |
-| M2+ | ⏳ |
-
 ## Repo layout
 
 ```

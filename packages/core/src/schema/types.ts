@@ -148,7 +148,18 @@ export type TransitionInput<
   readonly invariant?: InvariantFn<TParticipants, InferPayload<TPayloadSchema>>
   readonly needs?: string
   readonly unlocks?: readonly string[]
+  /**
+   * Outbox event name — past tense (`delivery.paid`). Drained by
+   * webhook / queue fan-out workers.
+   */
   readonly emit?: string
+  /**
+   * Outbox intent — imperative (`stripe.capture`, `mocked.charge`).
+   * Format is `<adapter>.<action>`. The outbox worker routes events
+   * with an `intent` to the adapter registered for that prefix; the
+   * generic `handler` only sees events without intents.
+   */
+  readonly intent?: string
 }
 
 export type TransitionDef<
@@ -168,6 +179,7 @@ export type TransitionDef<
   readonly needs?: string
   readonly unlocks: readonly string[]
   readonly emit?: string
+  readonly intent?: string
 }
 
 // =============================================================================

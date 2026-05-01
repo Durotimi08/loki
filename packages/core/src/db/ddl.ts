@@ -228,12 +228,16 @@ function buildPostingsTable(t: TableNamer): string {
 }
 
 function buildOutboxTable(schema: SchemaDef, t: TableNamer): string {
+  // Both `emit` and `intent` are valid event names: when only one is
+  // declared, the engine writes that string to `event` so the row is
+  // never NULL. Adapters consult `intent` for routing; webhook fan-out
+  // workers consult `event` for filtering.
   const eventNames = Array.from(
     new Set(
       schema.transactions.flatMap((tx) =>
-        Object.values(tx.transitions)
-          .map((tr) => tr.emit)
-          .filter((e): e is string => typeof e === 'string' && e.length > 0),
+        Object.values(tx.transitions).flatMap((tr) =>
+          [tr.emit, tr.intent].filter((e): e is string => typeof e === 'string' && e.length > 0),
+        ),
       ),
     ),
   )

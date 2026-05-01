@@ -237,6 +237,23 @@ export type SchemaInput = {
   readonly transactions: readonly TransactionDef[]
 }
 
+/**
+ * Per-version aliases — old name on the left, new name on the right.
+ * The engine consults the alias map when reading records written
+ * under earlier versions; old rows keep their original `schema_version`
+ * forever and are exposed under the current names. (§14.2 rename path.)
+ */
+export type AliasMap = {
+  /** `oldTransitionName -> newTransitionName`. */
+  readonly transitions?: Readonly<Record<string, string>>
+  /** `oldStateName -> newStateName` (per transaction type). */
+  readonly states?: Readonly<Record<string, Readonly<Record<string, string>>>>
+  /** `oldActorName -> newActorName`. */
+  readonly actors?: Readonly<Record<string, string>>
+  /** `oldAccountName -> newAccountName` (per actor type). */
+  readonly accounts?: Readonly<Record<string, Readonly<Record<string, string>>>>
+}
+
 export type SchemaDef<
   TTenant extends TenantDef = TenantDef,
   TActors extends readonly ActorDef[] = readonly ActorDef[],
@@ -246,6 +263,14 @@ export type SchemaDef<
   readonly tenant: TTenant
   readonly actors: TActors
   readonly transactions: TTransactions
+  /**
+   * Schema version stamped on every record / transition written under
+   * this schema. Defaults to 1. Bump it on every additive or rename
+   * change so old records retain their original semantics.
+   */
+  readonly version: number
+  /** Per-version alias maps for renames. Key is the version that produced rows. */
+  readonly aliases: Readonly<Record<number, AliasMap>>
   readonly meta: {
     /** Map of actor name → ActorDef. Built once at `defineSchema`. */
     readonly actorsByName: ReadonlyMap<string, ActorDef>

@@ -2,6 +2,12 @@ import type { Connection, SqlTransaction } from './connection.js'
 import type { HookRegistry } from './hooks.js'
 import type { CreateTenantInput, TenantRow } from './types.js'
 
+export type SchemaVersionCount = {
+  readonly version: number
+  readonly records: number
+  readonly transitions: number
+}
+
 /**
  * Admin operations — tenant lifecycle. These run *outside* a tenant
  * GUC because they cross tenants by definition. Per-tenant operations
@@ -10,6 +16,16 @@ import type { CreateTenantInput, TenantRow } from './types.js'
  */
 export type AdminOps = {
   readonly tenants: TenantOps
+  readonly schema: SchemaAdminOps
+}
+
+export type SchemaAdminOps = {
+  /**
+   * Count records and transitions grouped by their stored
+   * `schema_version`. Use this to plan a deprecation: if version 1
+   * still has live records, you can't yet remove its compat code.
+   */
+  versions(tenantId?: string): Promise<readonly SchemaVersionCount[]>
 }
 
 export type TenantOps = {
@@ -53,6 +69,49 @@ export function buildAdminOps(connection: Connection, hooks?: HookRegistry): Adm
     })
   }
   return {
+    schema: {
+      async versions(tenantId) {
+        return connection.asAdmin(async (tx) => {
+          type Row = { version: number; records: string; transitions: string }
+          const rows = tenantId
+            ? await tx<Row[]>`
+                select v.version,
+                       count(distinct r.id)::text as records,
+                       count(distinct t.id)::text as transitions
+                from (
+                  select schema_version as version from "txn_records" where tenant_id = ${tenantId}
+                  union
+                  select schema_version as version from "txn_transitions" where tenant_id = ${tenantId}
+                ) v
+                left join "txn_records" r
+                  on r.schema_version = v.version and r.tenant_id = ${tenantId}
+                left join "txn_transitions" t
+                  on t.schema_version = v.version and t.tenant_id = ${tenantId}
+                group by v.version
+                order by v.version
+              `
+            : await tx<Row[]>`
+                select v.version,
+                       count(distinct r.id)::text as records,
+                       count(distinct t.id)::text as transitions
+                from (
+                  select schema_version as version from "txn_records"
+                  union
+                  select schema_version as version from "txn_transitions"
+                ) v
+                left join "txn_records" r on r.schema_version = v.version
+                left join "txn_transitions" t on t.schema_version = v.version
+                group by v.version
+                order by v.version
+              `
+          return rows.map((r) => ({
+            version: r.version,
+            records: Number(r.records),
+            transitions: Number(r.transitions),
+          }))
+        })
+      },
+    },
     tenants: {
       async create(input) {
         const result = await connection.asAdmin(async (tx) => {

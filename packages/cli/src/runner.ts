@@ -1,6 +1,7 @@
 import { parseArgs } from 'node:util'
 import { runMigrate } from './commands/migrate.js'
 import { runReconcile } from './commands/reconcile.js'
+import { runSchema } from './commands/schema.js'
 import { runTenant } from './commands/tenant.js'
 import { type LokiConfig, loadConfig } from './config.js'
 import { type Io, stdIo } from './io.js'
@@ -34,6 +35,9 @@ Commands:
   tenant suspend <id>
   tenant activate <id>
   tenant delete <id>
+
+  schema versions [--tenant <id>]
+  schema diff --from <config-path>
 
 Global flags:
   --config <path>             Path to a loki.config.{js,mjs,ts} module
@@ -74,6 +78,8 @@ export async function run(options: RunnerOptions): Promise<number> {
         return await runReconcileCommand(config, rest, io)
       case 'tenant':
         return await runTenantCommand(config, rest, io)
+      case 'schema':
+        return await runSchemaCommand(config, rest, io)
       default:
         io.err(`Unknown command: ${command ?? '<missing>'}`)
         io.err(HELP)
@@ -180,6 +186,50 @@ async function runTenantCommand(
     }
     default:
       io.err(`tenant: unknown subcommand "${sub ?? '<missing>'}".`)
+      return 2
+  }
+}
+
+async function runSchemaCommand(
+  config: LokiConfig,
+  args: readonly string[],
+  io: Io,
+): Promise<number> {
+  const sub = args[0]
+  const rest = args.slice(1)
+  switch (sub) {
+    case 'versions': {
+      const parsed = parseArgs({
+        args: [...rest],
+        options: { tenant: { type: 'string' } },
+        allowPositionals: false,
+        strict: true,
+      })
+      return runSchema(
+        config,
+        {
+          kind: 'versions',
+          ...(parsed.values.tenant !== undefined ? { tenant: parsed.values.tenant } : {}),
+        },
+        io,
+      )
+    }
+    case 'diff': {
+      const parsed = parseArgs({
+        args: [...rest],
+        options: { from: { type: 'string' } },
+        allowPositionals: false,
+        strict: true,
+      })
+      const from = parsed.values.from
+      if (!from) {
+        io.err('schema diff: usage: schema diff --from <config-path>')
+        return 2
+      }
+      return runSchema(config, { kind: 'diff', fromConfig: from }, io)
+    }
+    default:
+      io.err(`schema: unknown subcommand "${sub ?? '<missing>'}".`)
       return 2
   }
 }

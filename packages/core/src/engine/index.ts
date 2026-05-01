@@ -1,7 +1,13 @@
 // Public surface for the engine.
 
 export { buildAdminOps } from './admin.js'
-export type { AdminOps, TenantOps, TenantSnapshot } from './admin.js'
+export type {
+  AdminOps,
+  SchemaAdminOps,
+  SchemaVersionCount,
+  TenantOps,
+  TenantSnapshot,
+} from './admin.js'
 
 export { isSagaSuccess, runSaga } from './saga.js'
 export type { SagaContext, SagaOptions, SagaResult, SagaStep } from './saga.js'

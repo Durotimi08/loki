@@ -115,7 +115,14 @@ export function buildRecordOps(ctx: RecordOpsContext): RecordOps {
           return { record, replayed: true, transitionId: existing.id }
         }
 
-        const recordId = await insertRecord(tx, tenantId, txn, input.by, participants)
+        const recordId = await insertRecord(
+          tx,
+          tenantId,
+          txn,
+          input.by,
+          participants,
+          schema.version,
+        )
         const transitionId = ulid()
         const occurredAt = new Date()
 
@@ -127,7 +134,7 @@ export function buildRecordOps(ctx: RecordOpsContext): RecordOps {
           from_state: null,
           to_state: txn.initial,
           name: GENESIS_NAME,
-          schema_version: 1,
+          schema_version: schema.version,
           actor_type: input.by.type,
           actor_id: input.by.id,
           payload: {},
@@ -146,7 +153,7 @@ export function buildRecordOps(ctx: RecordOpsContext): RecordOps {
             postings_checksum, reverses, occurred_at
           ) values (
             ${transitionId}, ${tenantId}, ${recordId}, ${txn.name}, ${null},
-            ${txn.initial}, ${GENESIS_NAME}, ${1}, ${input.by.type}, ${input.by.id},
+            ${txn.initial}, ${GENESIS_NAME}, ${schema.version}, ${input.by.type}, ${input.by.id},
             ${tx.json({})}, ${input.idempotencyKey}, ${input.traceId ?? null},
             ${null}, ${rowHash}, ${postingsChecksum}, ${null}, ${occurredAt}
           )
@@ -381,7 +388,11 @@ async function runTransition(
       from_state: record.state,
       to_state: transitionDef.to,
       name: input.name,
-      schema_version: record.schemaVersion,
+      // Each transition row carries the schema version active *when
+      // it was written* (§14). Old records keep their original version;
+      // new transitions on them get today's. The reconciler reads
+      // both shapes through the alias map.
+      schema_version: schema.version,
       actor_type: input.by.type,
       actor_id: input.by.id,
       payload: jsonifyForStorage(data) as CanonicalValue,
@@ -408,7 +419,7 @@ async function runTransition(
         postings_checksum, reverses, occurred_at
       ) values (
         ${transitionId}, ${tenantId}, ${record.id}, ${record.type}, ${record.state},
-        ${transitionDef.to}, ${input.name}, ${record.schemaVersion},
+        ${transitionDef.to}, ${input.name}, ${schema.version},
         ${input.by.type}, ${input.by.id}, ${tx.json(jsonifyForStorage(data) as never)},
         ${input.idempotencyKey}, ${input.traceId ?? null},
         ${prevHash}, ${rowHash}, ${postingsChecksum}, ${reverses}, ${occurredAt}
@@ -698,15 +709,16 @@ async function insertRecord(
   txn: TransactionDef,
   by: ActorRef,
   participants: Readonly<Record<string, ActorRef>>,
+  schemaVersion: number,
 ): Promise<string> {
   const [row] = await tx<{ id: string }[]>`
     insert into "txn_records" (
       tenant_id, type, state, version, active_keys, participants,
-      created_by_actor_type, created_by_actor_id
+      schema_version, created_by_actor_type, created_by_actor_id
     ) values (
       ${tenantId}, ${txn.name}, ${txn.initial}, 0, ${tx.json([])},
       ${tx.json(participants as never)},
-      ${by.type}, ${by.id}
+      ${schemaVersion}, ${by.type}, ${by.id}
     ) returning id
   `
   if (!row) throw new LokiError('Record insert returned no row.')

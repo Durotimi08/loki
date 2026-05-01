@@ -12,6 +12,7 @@ export { type Io, bufferedIo, stdIo } from './io.js'
 export { run, type RunnerOptions } from './runner.js'
 export { runMigrate, type MigrateAction } from './commands/migrate.js'
 export { runReconcile, type ReconcileOptions } from './commands/reconcile.js'
+export { runSchema, type SchemaAction } from './commands/schema.js'
 export { runTenant, type TenantAction } from './commands/tenant.js'
 
 // When invoked as a binary (`loki ...`), run the CLI and exit. The

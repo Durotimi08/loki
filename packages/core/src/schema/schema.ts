@@ -1,5 +1,7 @@
-import type { ActorDef, SchemaDef, TenantDef, TransactionDef } from './types.js'
+import type { ActorDef, AliasMap, SchemaDef, TenantDef, TransactionDef } from './types.js'
 import { validateSchema } from './validate.js'
+export { diffSchemas } from './diff.js'
+export type { ChangeKind, SchemaChange, SchemaDiff } from './diff.js'
 
 export type SchemaInputArgs<
   TTenant extends TenantDef,
@@ -9,6 +11,18 @@ export type SchemaInputArgs<
   readonly tenant: TTenant
   readonly actors: TActors
   readonly transactions: TTransactions
+  /**
+   * Schema version stamped on every record + transition written under
+   * this schema. Bump on every rename / additive change. Defaults
+   * to 1.
+   */
+  readonly version?: number
+  /**
+   * Per-version alias maps. Map old names from earlier versions to the
+   * names this schema declares so old records keep their original
+   * semantics while new code reads with the new names.
+   */
+  readonly aliases?: Readonly<Record<number, AliasMap>>
   /**
    * Skip validation. Tests use this to assert that broken schemas are
    * detected at validation time without throwing during construction.
@@ -47,6 +61,8 @@ export function defineSchema<
     tenant: input.tenant,
     actors: input.actors,
     transactions: input.transactions,
+    version: input.version ?? 1,
+    aliases: input.aliases ?? {},
     meta: {
       actorsByName,
       transactionsByName,

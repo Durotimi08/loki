@@ -18,8 +18,9 @@ export type {
   TransitionFactory,
 } from './schema/transaction.js'
 
-export { defineSchema } from './schema/schema.js'
-export type { SchemaInputArgs } from './schema/schema.js'
+export { defineSchema, diffSchemas } from './schema/schema.js'
+export type { ChangeKind, SchemaChange, SchemaDiff, SchemaInputArgs } from './schema/schema.js'
+export type { AliasMap } from './schema/types.js'
 
 // --- schema types (runtime + type-only) ---
 export type {

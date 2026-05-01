@@ -1,4 +1,5 @@
 import type { Connection, SqlTransaction } from './connection.js'
+import type { HookRegistry } from './hooks.js'
 import type { CreateTenantInput, TenantRow } from './types.js'
 
 /**
@@ -24,17 +25,41 @@ export type TenantOps = {
   get(id: string): Promise<TenantRow | null>
   /** List all tenants in insertion order. */
   list(): Promise<readonly TenantRow[]>
+  /**
+   * Snapshot every row that belongs to the tenant — for compliance
+   * portability (GDPR), test fixtures, or migrating between tenancy
+   * modes. The export is a plain JSON object whose keys are table
+   * names and whose values are arrays of rows.
+   */
+  export(id: string): Promise<TenantSnapshot>
 }
 
-export function buildAdminOps(connection: Connection): AdminOps {
+export type TenantSnapshot = {
+  readonly tenantId: string
+  readonly exportedAt: string
+  readonly tables: Readonly<Record<string, readonly Record<string, unknown>[]>>
+}
+
+export function buildAdminOps(connection: Connection, hooks?: HookRegistry): AdminOps {
+  const fireLifecycle = async (
+    tenant: TenantRow,
+    action: 'created' | 'suspended' | 'activated' | 'deleted' | 'relocated',
+  ) => {
+    await hooks?.internals.fireTenantLifecycle({
+      tenantId: tenant.id,
+      action,
+      mode: tenant.mode,
+      at: new Date(),
+    })
+  }
   return {
     tenants: {
       async create(input) {
-        return connection.asAdmin(async (tx) => {
+        const result = await connection.asAdmin(async (tx) => {
           const [existing] = await tx<Record<string, unknown>[]>`
             select * from "tenants" where id = ${input.id}
           `
-          if (existing) return mapTenant(existing)
+          if (existing) return { tenant: mapTenant(existing), fresh: false }
 
           const mode = input.mode ?? 'row'
           const [row] = await tx<Record<string, unknown>[]>`
@@ -43,28 +68,36 @@ export function buildAdminOps(connection: Connection): AdminOps {
             returning *
           `
           if (!row) throw new Error('Tenant insert returned no row')
-          return mapTenant(row)
+          return { tenant: mapTenant(row), fresh: true }
         })
+        if (result.fresh) await fireLifecycle(result.tenant, 'created')
+        return result.tenant
       },
 
       async suspend(id) {
-        return connection.asAdmin(async (tx) => {
-          return mapTenant(await updateState(tx, id, 'suspended'))
-        })
+        const tenant = await connection.asAdmin(async (tx) =>
+          mapTenant(await updateState(tx, id, 'suspended')),
+        )
+        await fireLifecycle(tenant, 'suspended')
+        return tenant
       },
 
       async activate(id) {
-        return connection.asAdmin(async (tx) => {
+        const tenant = await connection.asAdmin(async (tx) => {
           const row = await updateState(tx, id, 'active')
           return mapTenant(row)
         })
+        await fireLifecycle(tenant, 'activated')
+        return tenant
       },
 
       async delete(id) {
-        return connection.asAdmin(async (tx) => {
+        const tenant = await connection.asAdmin(async (tx) => {
           const row = await updateState(tx, id, 'deleted')
           return mapTenant(row)
         })
+        await fireLifecycle(tenant, 'deleted')
+        return tenant
       },
 
       async get(id) {
@@ -82,6 +115,64 @@ export function buildAdminOps(connection: Connection): AdminOps {
             select * from "tenants" order by created_at, id
           `
           return rows.map(mapTenant)
+        })
+      },
+
+      async export(id) {
+        return connection.asAdmin(async (tx) => {
+          const [tenantRow] = await tx<Record<string, unknown>[]>`
+            select * from "tenants" where id = ${id}
+          `
+          if (!tenantRow) {
+            throw new Error(`Tenant "${id}" not found.`)
+          }
+          // Pull every row that belongs to the tenant, ordered for
+          // determinism. bytea hashes are emitted as hex so the
+          // snapshot survives JSON.stringify.
+          const records = await tx<Record<string, unknown>[]>`
+            select * from "txn_records" where tenant_id = ${id} order by created_at, id
+          `
+          const transitions = await tx<Record<string, unknown>[]>`
+            select id, tenant_id, txn_id, type, from_state, to_state, name, schema_version,
+                   actor_type, actor_id, payload, idempotency_key, trace_id,
+                   encode(prev_hash, 'hex') as prev_hash_hex,
+                   encode(row_hash, 'hex') as row_hash_hex,
+                   encode(postings_checksum, 'hex') as postings_checksum_hex,
+                   reverses, occurred_at
+            from "txn_transitions" where tenant_id = ${id} order by id
+          `
+          const accounts = await tx<Record<string, unknown>[]>`
+            select * from "accounts" where tenant_id = ${id}
+            order by owner_actor_type, owner_actor_id, name, currency, shard_index
+          `
+          const postings = await tx<Record<string, unknown>[]>`
+            select * from "postings" where tenant_id = ${id} order by occurred_at, id
+          `
+          const keys = await tx<Record<string, unknown>[]>`
+            select * from "txn_keys" where tenant_id = ${id} order by id
+          `
+          const outbox = await tx<Record<string, unknown>[]>`
+            select * from "outbox" where tenant_id = ${id} order by id
+          `
+          const anomalies = await tx<Record<string, unknown>[]>`
+            select * from "txn_anomalies" where tenant_id = ${id} order by detected_at, id
+          `
+
+          const snapshot: TenantSnapshot = {
+            tenantId: id,
+            exportedAt: new Date().toISOString(),
+            tables: {
+              tenants: [tenantRow],
+              txn_records: records,
+              txn_transitions: transitions,
+              accounts: accounts,
+              postings: postings,
+              txn_keys: keys,
+              outbox: outbox,
+              txn_anomalies: anomalies,
+            },
+          }
+          return snapshot
         })
       },
     },

@@ -90,7 +90,14 @@ export type TransitionInput<
  *   client.deliveryPayment.transition(id, 'pay', {...})
  *   client.deliveryPayment.get(id)
  *   client.deliveryPayment.trace(id)
+ *   client.deliveryPayment.on('completed', handler)
  */
+export type TransactionEvent = {
+  readonly record: TxnRecord
+  readonly transition: TxnTransition
+  readonly unlocked: Readonly<Record<string, string>>
+}
+
 // biome-ignore lint/suspicious/noExplicitAny: variance escape
 export type TransactionClient<TX extends TransactionDef<any, any, any, any>> = {
   /** Provision a new record in the schema-declared initial state. */
@@ -105,6 +112,15 @@ export type TransactionClient<TX extends TransactionDef<any, any, any, any>> = {
   get(id: string): Promise<TxnRecord | null>
   /** Read the full ordered transition trail for one record. */
   trace(id: string): Promise<readonly TxnTransition[]>
+  /**
+   * Subscribe to records that *land* in `state` after a transition.
+   * Thin shorthand for `engine.hooks.afterTransition` filtered by
+   * `txnType` and `record.state`. Returns an unsubscribe function.
+   */
+  on(
+    state: TX['states'][number],
+    handler: (event: TransactionEvent) => void | Promise<void>,
+  ): () => void
 }
 
 /**

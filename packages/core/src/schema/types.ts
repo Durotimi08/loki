@@ -147,7 +147,12 @@ export type TransitionInput<
   readonly postings?: PostingsSpec<TParticipants, InferPayload<TPayloadSchema>>
   readonly invariant?: InvariantFn<TParticipants, InferPayload<TPayloadSchema>>
   readonly needs?: string
-  readonly unlocks?: readonly string[]
+  /**
+   * Capability keys minted on success. Strings mint a non-expiring
+   * key; the object form sets `ttlMs` so the engine refuses the key
+   * after that deadline.
+   */
+  readonly unlocks?: readonly (string | { readonly name: string; readonly ttlMs: number })[]
   /**
    * Outbox event name — past tense (`delivery.paid`). Drained by
    * webhook / queue fan-out workers.
@@ -177,7 +182,7 @@ export type TransitionDef<
   readonly postings?: PostingsSpec<TParticipants, InferPayload<TPayloadSchema>>
   readonly invariant?: InvariantFn<TParticipants, InferPayload<TPayloadSchema>>
   readonly needs?: string
-  readonly unlocks: readonly string[]
+  readonly unlocks: readonly (string | { readonly name: string; readonly ttlMs: number })[]
   readonly emit?: string
   readonly intent?: string
 }

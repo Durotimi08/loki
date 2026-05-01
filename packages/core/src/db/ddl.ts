@@ -191,7 +191,9 @@ function buildTxnKeysTable(schema: SchemaDef, t: TableNamer): string {
   const keyNames = Array.from(
     new Set(
       schema.transactions.flatMap((tx) =>
-        Object.values(tx.transitions).flatMap((tr: TransitionDef) => [...tr.unlocks]),
+        Object.values(tx.transitions).flatMap((tr: TransitionDef) =>
+          tr.unlocks.map((spec) => (typeof spec === 'string' ? spec : spec.name)),
+        ),
       ),
     ),
   )

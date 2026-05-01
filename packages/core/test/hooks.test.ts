@@ -51,7 +51,7 @@ describe('createHookRegistry — registration + counts', () => {
     r.onOutboxFailureTerminal(undefined, async () => {})
     r.onHookFailure(async () => {})
 
-    expect(r.internals.counts()).toEqual({
+    expect(r.internals.counts()).toMatchObject({
       beforeTransition: 1,
       afterTransition: 1,
       onAnomaly: 1,

@@ -49,9 +49,26 @@ import type {
 export type RecordOps = {
   create(input: CreateRecordInput): Promise<CreateRecordResult>
   transition(input: TransitionInputArgs): Promise<TransitionResult>
+  /**
+   * Drive many transitions sequentially. The engine still wraps each
+   * transition in its own DB tx — bulk semantics here are about
+   * amortizing client-side overhead and giving callers a single
+   * `Promise.allSettled`-style result, not relaxing atomicity. Failed
+   * transitions surface as `{ ok: false, error }` entries so the
+   * caller can decide whether to retry or escalate without one bad
+   * row taking down the whole batch.
+   */
+  bulkTransition(
+    inputs: readonly TransitionInputArgs[],
+    options?: { readonly batchSize?: number; readonly stopOnError?: boolean },
+  ): Promise<readonly BulkTransitionItem[]>
   get(id: string): Promise<TxnRecord | null>
   trace(id: string): Promise<readonly TxnTransition[]>
 }
+
+export type BulkTransitionItem =
+  | { readonly ok: true; readonly index: number; readonly result: TransitionResult }
+  | { readonly ok: false; readonly index: number; readonly error: Error }
 
 export type RecordOpsContext = {
   readonly schema: SchemaDef
@@ -163,6 +180,28 @@ export function buildRecordOps(ctx: RecordOpsContext): RecordOps {
       return { record: result.record, replayed: result.replayed }
     },
 
+    async bulkTransition(inputs, options = {}) {
+      const stopOnError = options.stopOnError ?? false
+      const batchSize = options.batchSize ?? 100
+      const results: BulkTransitionItem[] = []
+      for (let i = 0; i < inputs.length; i += batchSize) {
+        const slice = inputs.slice(i, i + batchSize)
+        for (let j = 0; j < slice.length; j++) {
+          const idx = i + j
+          const input = slice[j] as TransitionInputArgs
+          try {
+            const result = await runTransition(ctx, input)
+            results.push({ ok: true, index: idx, result })
+          } catch (e) {
+            const error = e instanceof Error ? e : new Error(String(e))
+            results.push({ ok: false, index: idx, error })
+            if (stopOnError) return results
+          }
+        }
+      }
+      return results
+    },
+
     async transition(input) {
       return runTransition(ctx, input)
     },
@@ -251,6 +290,13 @@ async function runTransition(
         for update
       `
       if (!keyRow || keyRow['status'] !== 'active' || keyRow['name'] !== keyName) {
+        throw new KeyAlreadyConsumedError(record.id, keyName)
+      }
+      // Honour `expires_at`. The reconciler is the janitor that flips
+      // stale rows to `status = 'expired'` (any side-effect inside this
+      // tx would be rolled back when we throw); here we only refuse.
+      const expiresAt = keyRow['expires_at'] as Date | null
+      if (expiresAt !== null && expiresAt.getTime() <= Date.now()) {
         throw new KeyAlreadyConsumedError(record.id, keyName)
       }
     }
@@ -404,12 +450,15 @@ async function runTransition(
     }
 
     const unlockedMap: Record<string, string> = {}
-    for (const keyName of transitionDef.unlocks) {
+    for (const spec of transitionDef.unlocks) {
+      const keyName = typeof spec === 'string' ? spec : spec.name
+      const ttlMs = typeof spec === 'string' ? null : spec.ttlMs
+      const expiresAt = ttlMs !== null ? new Date(occurredAt.getTime() + ttlMs) : null
       const [row] = await tx<Record<string, unknown>[]>`
         insert into "txn_keys" (
-          tenant_id, txn_id, name, granted_by_transition_id, status
+          tenant_id, txn_id, name, granted_by_transition_id, status, expires_at
         ) values (
-          ${tenantId}, ${record.id}, ${keyName}, ${transitionId}, 'active'
+          ${tenantId}, ${record.id}, ${keyName}, ${transitionId}, 'active', ${expiresAt}
         ) returning id
       `
       if (row) unlockedMap[keyName] = row['id'] as string
@@ -419,7 +468,9 @@ async function runTransition(
     // the consumed one.
     const activeKeysSet = new Set(record.activeKeys)
     if (transitionDef.needs) activeKeysSet.delete(transitionDef.needs)
-    for (const k of transitionDef.unlocks) activeKeysSet.add(k)
+    for (const spec of transitionDef.unlocks) {
+      activeKeysSet.add(typeof spec === 'string' ? spec : spec.name)
+    }
     const activeKeys = Array.from(activeKeysSet)
 
     // ---- 10. Bump record state + version ---------------------------------
@@ -486,6 +537,17 @@ async function runTransition(
       transitionName: result.transition.name,
       unlocked: result.unlocked,
     })
+    if (result.transition.reverses !== null) {
+      await hooks.internals.fireReversal({
+        tenantId,
+        recordId: result.record.id,
+        txnType: result.record.type,
+        reverseTransitionId: result.transition.id,
+        reversedTransitionId: result.transition.reverses,
+        transitionName: result.transition.name,
+        automated: false,
+      })
+    }
   }
 
   return result
@@ -775,21 +837,27 @@ async function resolveDrafts(
     if (d.amount < 0n) {
       throw new UnbalancedPostingsError(0n, 0n)
     }
-    const [acc] = await tx<{ id: string }[]>`
+    // Hot-account sharding (§6.1): for accounts declared with
+    // `shards: N`, the engine picks a shard pseudorandomly at write
+    // time. Reads sum across shards; the cache stays correct because
+    // every leg of the same posting only updates one shard. shard 0
+    // is the only shard for unsharded accounts, so the random pick
+    // collapses to it.
+    const ids = await tx<{ id: string }[]>`
       select id from "accounts"
       where tenant_id = ${tenantId}
         and owner_actor_type = ${ref.actorType}
         and owner_actor_id = ${ref.actorId}
         and name = ${ref.accountName}
         and currency = ${ref.currency}
-        and shard_index = 0
     `
-    if (!acc) {
+    if (ids.length === 0) {
       throw new LokiError(
         `Posting target account ${ref.actorType}:${ref.actorId}.${ref.accountName} (${ref.currency}) does not exist; provision it via accounts.create() first.`,
       )
     }
-    out.push({ accountId: acc.id, direction: d.direction, amount: d.amount })
+    const pick = ids[Math.floor(Math.random() * ids.length)] as { id: string }
+    out.push({ accountId: pick.id, direction: d.direction, amount: d.amount })
   }
   return out
 }

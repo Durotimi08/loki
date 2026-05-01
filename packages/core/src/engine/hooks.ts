@@ -83,6 +83,56 @@ export type HookFailureEvent = {
   readonly error: unknown
 }
 
+/**
+ * Subset of `AnomalyEvent` whose `severity === 'critical'`. Fires on
+ * the same event as `onAnomaly` for the integrity-class checks
+ * (hash_chain_break, checksum_mismatch, fabricated_key) so consumers
+ * can route paging without writing a `severity === 'critical'` filter.
+ */
+export type IntegrityViolationEvent = AnomalyEvent
+
+/**
+ * Fires when the engine emits a reversal transition — either a
+ * user-driven `invert:` transition or an automated `revert_<original>`
+ * issued by the self-correction layer.
+ */
+export type ReversalEvent = {
+  readonly tenantId: string
+  readonly recordId: string
+  readonly txnType: string
+  readonly reverseTransitionId: string
+  readonly reversedTransitionId: string
+  readonly transitionName: string
+  /** True when emitted by the reconciler's auto-correction path; false for explicit user reversals. */
+  readonly automated: boolean
+}
+
+/** Fires after every `reconciler.runOnce()` pass, regardless of result. */
+export type ReconciliationCompleteEvent = {
+  readonly startedAt: Date
+  readonly finishedAt: Date
+  readonly anomaliesFound: number
+  readonly quarantined: number
+  readonly tenantId?: string
+  readonly fullSweep: boolean
+}
+
+/** Fires after every successful migration apply / rollback. */
+export type SchemaMigrationEvent = {
+  readonly id: string
+  readonly direction: 'up' | 'down'
+  readonly checksum: string
+  readonly appliedAt: Date
+}
+
+/** Fires after every tenant lifecycle change. */
+export type TenantLifecycleEvent = {
+  readonly tenantId: string
+  readonly action: 'created' | 'suspended' | 'activated' | 'deleted' | 'relocated'
+  readonly mode?: 'db' | 'schema' | 'row'
+  readonly at: Date
+}
+
 // =============================================================================
 // Filter primitives
 // =============================================================================
@@ -155,6 +205,31 @@ export type HookRegistry = {
     filter: Filter<OutboxFailureTerminalEvent> | undefined,
     handler: Handler<OutboxFailureTerminalEvent>,
   ): Unsubscribe
+  /** Critical-severity subset of `onAnomaly`. */
+  onIntegrityViolation(
+    filter: Filter<IntegrityViolationEvent> | undefined,
+    handler: Handler<IntegrityViolationEvent>,
+  ): Unsubscribe
+  /** Fires when the engine emits a reversal transition. */
+  onReversal(
+    filter: Filter<ReversalEvent> | undefined,
+    handler: Handler<ReversalEvent>,
+  ): Unsubscribe
+  /** Fires after every `reconciler.runOnce()` pass. */
+  onReconciliationComplete(
+    filter: Filter<ReconciliationCompleteEvent> | undefined,
+    handler: Handler<ReconciliationCompleteEvent>,
+  ): Unsubscribe
+  /** Fires after every successful migration. */
+  onSchemaMigration(
+    filter: Filter<SchemaMigrationEvent> | undefined,
+    handler: Handler<SchemaMigrationEvent>,
+  ): Unsubscribe
+  /** Fires after tenant create / suspend / activate / delete / relocate. */
+  onTenantLifecycle(
+    filter: Filter<TenantLifecycleEvent> | undefined,
+    handler: Handler<TenantLifecycleEvent>,
+  ): Unsubscribe
   /** Catches errors thrown from any other hook handler. */
   onHookFailure(handler: Handler<HookFailureEvent>): Unsubscribe
 
@@ -168,6 +243,11 @@ export type HookInternals = {
   fireAnomaly(event: AnomalyEvent): Promise<void>
   fireQuarantine(event: QuarantineEvent): Promise<void>
   fireOutboxFailureTerminal(event: OutboxFailureTerminalEvent): Promise<void>
+  fireIntegrityViolation(event: IntegrityViolationEvent): Promise<void>
+  fireReversal(event: ReversalEvent): Promise<void>
+  fireReconciliationComplete(event: ReconciliationCompleteEvent): Promise<void>
+  fireSchemaMigration(event: SchemaMigrationEvent): Promise<void>
+  fireTenantLifecycle(event: TenantLifecycleEvent): Promise<void>
   /** Number of registered handlers per hook (test inspection). */
   readonly counts: () => Readonly<Record<string, number>>
 }
@@ -180,6 +260,11 @@ export function createHookRegistry(): HookRegistry {
   const anomaly: Registration<AnomalyEvent>[] = []
   const quarantine: Registration<QuarantineEvent>[] = []
   const outboxTerminal: Registration<OutboxFailureTerminalEvent>[] = []
+  const integrityViolation: Registration<IntegrityViolationEvent>[] = []
+  const reversal: Registration<ReversalEvent>[] = []
+  const reconciliationComplete: Registration<ReconciliationCompleteEvent>[] = []
+  const schemaMigration: Registration<SchemaMigrationEvent>[] = []
+  const tenantLifecycle: Registration<TenantLifecycleEvent>[] = []
   const failure: Handler<HookFailureEvent>[] = []
 
   function add<E>(
@@ -247,6 +332,21 @@ export function createHookRegistry(): HookRegistry {
     onOutboxFailureTerminal(filter, handler) {
       return add(outboxTerminal, filter, handler)
     },
+    onIntegrityViolation(filter, handler) {
+      return add(integrityViolation, filter, handler)
+    },
+    onReversal(filter, handler) {
+      return add(reversal, filter, handler)
+    },
+    onReconciliationComplete(filter, handler) {
+      return add(reconciliationComplete, filter, handler)
+    },
+    onSchemaMigration(filter, handler) {
+      return add(schemaMigration, filter, handler)
+    },
+    onTenantLifecycle(filter, handler) {
+      return add(tenantLifecycle, filter, handler)
+    },
     onHookFailure(handler) {
       failure.push(handler)
       return () => {
@@ -278,6 +378,21 @@ export function createHookRegistry(): HookRegistry {
       async fireOutboxFailureTerminal(event) {
         await fireFireAndForget('onOutboxFailureTerminal', outboxTerminal, event)
       },
+      async fireIntegrityViolation(event) {
+        await fireFireAndForget('onIntegrityViolation', integrityViolation, event)
+      },
+      async fireReversal(event) {
+        await fireFireAndForget('onReversal', reversal, event)
+      },
+      async fireReconciliationComplete(event) {
+        await fireFireAndForget('onReconciliationComplete', reconciliationComplete, event)
+      },
+      async fireSchemaMigration(event) {
+        await fireFireAndForget('onSchemaMigration', schemaMigration, event)
+      },
+      async fireTenantLifecycle(event) {
+        await fireFireAndForget('onTenantLifecycle', tenantLifecycle, event)
+      },
       counts() {
         return {
           beforeTransition: before.length,
@@ -285,6 +400,11 @@ export function createHookRegistry(): HookRegistry {
           onAnomaly: anomaly.length,
           onQuarantine: quarantine.length,
           onOutboxFailureTerminal: outboxTerminal.length,
+          onIntegrityViolation: integrityViolation.length,
+          onReversal: reversal.length,
+          onReconciliationComplete: reconciliationComplete.length,
+          onSchemaMigration: schemaMigration.length,
+          onTenantLifecycle: tenantLifecycle.length,
           onHookFailure: failure.length,
         }
       },

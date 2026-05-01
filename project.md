@@ -243,7 +243,7 @@ Each request sets `ledger.tenant_id` at connection time via a session GUC. A que
 ### 7.5 Per-tenant observability
 
 - **Anomalies** scope per tenant — an anomaly in tenant A never affects tenant B's quarantines, alerts, or reconciliation reports.
-- **Outbox** routes per tenant — each tenant has its own webhook URLs and signing keys.
+- **Outbox** rows carry `tenant_id`. Filtering, routing, signing, retry policy — anything touching the wire — is the consumer's worker code, not the library's.
 - **Hooks** can filter by `tenantId` — escalate one tenant's anomalies through PagerDuty, another's into Slack.
 - **Reports** (balance, anomaly count, transition volume) compute per-tenant totals.
 
@@ -708,10 +708,14 @@ Iteration over millions of records: O(N) total work, O(1) memory, constant per-p
 ### 11.8 Subscriptions and hooks
 
 ```ts
-client.deliveryPayment.on('completed', async ({ txn, unlocked }) => { ... })   // in-process
-client.outbox.subscribe({ url, signingSecret })                                // out-of-process
-ledger.onAnomaly({ severity: 'critical' }, async (a) => pagerduty.trigger(a))  // cross-cutting
+client.deliveryPayment.on('completed', async ({ record, transition, unlocked }) => { ... })  // in-process
+ledger.onAnomaly({ severity: 'critical' }, async (a) => pagerduty.trigger(a))                // cross-cutting
 ```
+
+Out-of-process delivery (webhooks, queues) is a consumer concern: drain
+the outbox with `engine.outbox.startWorker({ handler })` and do
+whatever HTTP / signing / retry / dead-lettering your platform needs.
+The library's job ends at exposing the events.
 
 (Full hook surface in §8.)
 

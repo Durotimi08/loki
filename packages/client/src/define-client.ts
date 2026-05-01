@@ -41,13 +41,17 @@ export function defineClient<S extends SchemaDef>(
   const out: Record<string, unknown> = { tenantId }
   for (const tx of schema.transactions) {
     const key = decapitalize(tx.name)
-    out[key] = buildTransactionClient(tenant, tx.name)
+    out[key] = buildTransactionClient(engine, tenant, tx.name)
   }
 
   return out as TypedClient<S>
 }
 
-function buildTransactionClient(tenant: TenantClient, type: string): TransactionClient<never> {
+function buildTransactionClient(
+  engine: Engine,
+  tenant: TenantClient,
+  type: string,
+): TransactionClient<never> {
   return {
     async create(input) {
       const args: CreateRecordInput = {
@@ -76,6 +80,21 @@ function buildTransactionClient(tenant: TenantClient, type: string): Transaction
     },
     trace(id) {
       return tenant.transactions.trace(id)
+    },
+    on(state, handler) {
+      return engine.hooks.afterTransition(
+        (event) =>
+          event.tenantId === tenant.tenantId &&
+          event.txnType === type &&
+          event.record.state === state,
+        async (event) => {
+          await handler({
+            record: event.record,
+            transition: event.transition,
+            unlocked: event.unlocked,
+          })
+        },
+      )
     },
   } as TransactionClient<never>
 }

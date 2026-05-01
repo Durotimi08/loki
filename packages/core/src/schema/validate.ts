@@ -258,7 +258,9 @@ function validateTransactionTransitions(
   // Collect every key name minted by any transition (for `needs` resolution).
   const allUnlocks = new Set<string>()
   for (const t of Object.values(txn.transitions)) {
-    for (const k of t.unlocks) allUnlocks.add(k)
+    for (const k of t.unlocks) {
+      allUnlocks.add(typeof k === 'string' ? k : k.name)
+    }
   }
 
   const seenNames = new Set<string>()
@@ -401,7 +403,8 @@ function validateTransitionKeys(
   }
 
   const seen = new Set<string>()
-  transition.unlocks.forEach((k, i) => {
+  transition.unlocks.forEach((spec, i) => {
+    const k = typeof spec === 'string' ? spec : spec.name
     if (seen.has(k)) {
       ctx.add(
         'duplicate_state',

@@ -3,6 +3,7 @@ import { ident } from '../db/sql.js'
 import type { MigrationPlan } from '../db/types.js'
 import type { Connection, SqlTransaction } from './connection.js'
 import { MigrationMismatchError } from './errors.js'
+import type { HookRegistry } from './hooks.js'
 
 /**
  * Migration runner. The runner owns a single bookkeeping table,
@@ -43,7 +44,7 @@ export type Migrator = {
   rollback(plan: MigrationPlan): Promise<void>
 }
 
-export function createMigrator(connection: Connection): Migrator {
+export function createMigrator(connection: Connection, hooks?: HookRegistry): Migrator {
   return {
     async apply(plans) {
       const newlyApplied: AppliedMigration[] = []
@@ -76,6 +77,16 @@ export function createMigrator(connection: Connection): Migrator {
           newlyApplied.push(row)
         }
       })
+      // Hooks fire post-commit so a slow handler can never roll back
+      // a migration that already landed.
+      for (const row of newlyApplied) {
+        await hooks?.internals.fireSchemaMigration({
+          id: row.id,
+          direction: 'up',
+          checksum: row.checksum,
+          appliedAt: row.applied_at,
+        })
+      }
       return newlyApplied
     },
 
@@ -95,10 +106,17 @@ export function createMigrator(connection: Connection): Migrator {
     },
 
     async rollback(plan) {
+      const checksum = sha256Hex(plan.toUpSql())
       await connection.asAdmin(async (tx) => {
         await ensureMigrationsTable(tx)
         await applyDownSql(tx, plan)
         await tx`delete from ${tx(MIGRATIONS_TABLE)} where id = ${plan.id}`
+      })
+      await hooks?.internals.fireSchemaMigration({
+        id: plan.id,
+        direction: 'down',
+        checksum,
+        appliedAt: new Date(),
       })
     },
   }

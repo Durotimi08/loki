@@ -1,8 +1,12 @@
+import { mapAccount } from './accounts.js'
+import type { CanonicalValue } from './canonical.js'
 import type { Connection, SqlTransaction } from './connection.js'
 import { type Cursor, type Page, decodeCursor, encodeCursor } from './cursor.js'
 import { LokiError } from './errors.js'
+import { type Hasher, computePostingsChecksum, computeRowHash } from './hash.js'
 import type {
   AccountIdentity,
+  AccountRow,
   ActorRef,
   AnomalyRow,
   Posting as EnginePosting,
@@ -32,6 +36,24 @@ export type QueryOps = {
   transitions: { findMany(args?: FindManyTransitionsArgs): Promise<Page<TxnTransition>> }
   anomalies: { findMany(args?: FindManyAnomaliesArgs): Promise<Page<AnomalyRow>> }
   postings: { findMany(args?: FindManyPostingsArgs): Promise<Page<EnginePosting>> }
+  /**
+   * On-demand integrity recheck for a single record. Recomputes the
+   * hash chain and posting checksums and compares against stored
+   * values without writing to `txn_anomalies`.
+   */
+  verify(txnId: string, hasher: Hasher): Promise<VerifyResult>
+}
+
+export type VerifyResult = {
+  readonly ok: boolean
+  readonly recordId: string
+  readonly transitionsChecked: number
+  readonly issues: readonly {
+    readonly transitionId: string
+    readonly check: 'hash_chain_break' | 'checksum_mismatch'
+    readonly expected: string
+    readonly observed: string
+  }[]
 }
 
 export type ActorScopedOps = {
@@ -39,6 +61,18 @@ export type ActorScopedOps = {
   transactions(args?: ActorTransactionsArgs): Promise<Page<TxnRecord>>
   /** Aggregate summary for the actor over a window. */
   summary(args?: ActorSummaryArgs): Promise<ActorSummary>
+  /**
+   * Full transition trail for every record in `transactions(...)`'s
+   * page. Use only with a small `limit` — each item triggers a join.
+   */
+  trails(args?: ActorTransactionsArgs): Promise<
+    Page<{
+      readonly record: TxnRecord
+      readonly trail: readonly TxnTransition[]
+    }>
+  >
+  /** All accounts owned by the actor (every name, every shard). */
+  accounts(): Promise<readonly AccountRow[]>
 }
 
 export type AccountQueryOps = {
@@ -46,6 +80,29 @@ export type AccountQueryOps = {
   history(account: AccountIdentity, args?: AccountHistoryArgs): Promise<Page<EnginePosting>>
   /** Point-in-time balance, computed by replaying postings up to `when`. */
   balanceAt(account: AccountIdentity, when: Date): Promise<bigint>
+  /** Aggregate metrics over an account's posting history. */
+  aggregate(account: AccountIdentity, args?: AccountAggregateArgs): Promise<AccountAggregate>
+}
+
+export type AccountAggregateArgs = {
+  readonly since?: DateLike
+  readonly until?: DateLike
+  readonly metrics?: readonly AccountAggregateMetric[]
+}
+
+export type AccountAggregateMetric =
+  | 'count'
+  | 'sum_credit'
+  | 'sum_debit'
+  | 'min_amount'
+  | 'max_amount'
+
+export type AccountAggregate = {
+  readonly count: number
+  readonly sumCredit: bigint
+  readonly sumDebit: bigint
+  readonly minAmount: bigint | null
+  readonly maxAmount: bigint | null
 }
 
 // =============================================================================
@@ -158,6 +215,22 @@ export function buildQueryOps(tenantId: string, connection: Connection): QueryOp
             return await actorSummary(tx, tenantId, actor, args)
           })
         },
+        async trails(args = {}) {
+          return connection.withTenant(tenantId, async (tx) => {
+            const page = await actorTransactions(tx, tenantId, actor, args)
+            const items = []
+            for (const record of page.items) {
+              const trail = await loadTrail(tx, tenantId, record.id)
+              items.push({ record, trail })
+            }
+            return { items, nextCursor: page.nextCursor }
+          })
+        },
+        async accounts() {
+          return connection.withTenant(tenantId, async (tx) => {
+            return await actorAccounts(tx, tenantId, actor)
+          })
+        },
       }
     },
 
@@ -170,6 +243,11 @@ export function buildQueryOps(tenantId: string, connection: Connection): QueryOp
       async balanceAt(account, when) {
         return connection.withTenant(tenantId, async (tx) => {
           return await accountBalanceAt(tx, tenantId, account, toDate(when))
+        })
+      },
+      async aggregate(account, args = {}) {
+        return connection.withTenant(tenantId, async (tx) => {
+          return await accountAggregate(tx, tenantId, account, args)
         })
       },
     },
@@ -201,6 +279,11 @@ export function buildQueryOps(tenantId: string, connection: Connection): QueryOp
           return await findManyPostings(tx, tenantId, args)
         })
       },
+    },
+    async verify(txnId, hasher) {
+      return connection.withTenant(tenantId, async (tx) => {
+        return await verifyRecord(tx, tenantId, txnId, hasher)
+      })
     },
   }
 }
@@ -621,6 +704,176 @@ function packAnomalies(rows: Record<string, unknown>[], limit: number): Page<Ano
     overflow && last ? makeCursor([last['detected_at'] as Date, last['id'] as string]) : null
   return { items, nextCursor }
 }
+
+// =============================================================================
+// New helpers — trails, accounts, aggregate, verify
+// =============================================================================
+
+async function loadTrail(
+  tx: SqlTransaction,
+  tenantId: string,
+  txnId: string,
+): Promise<readonly TxnTransition[]> {
+  const rows = await tx<Record<string, unknown>[]>`
+    select * from "txn_transitions"
+    where tenant_id = ${tenantId} and txn_id = ${txnId}
+    order by id asc
+  `
+  return rows.map(mapTransition)
+}
+
+async function actorAccounts(
+  tx: SqlTransaction,
+  tenantId: string,
+  actor: ActorRef,
+): Promise<readonly AccountRow[]> {
+  const rows = await tx<Record<string, unknown>[]>`
+    select * from "accounts"
+    where tenant_id = ${tenantId}
+      and owner_actor_type = ${actor.type}
+      and owner_actor_id = ${actor.id}
+    order by name, currency, shard_index
+  `
+  return rows.map(mapAccount)
+}
+
+async function accountAggregate(
+  tx: SqlTransaction,
+  tenantId: string,
+  account: AccountIdentity,
+  args: AccountAggregateArgs,
+): Promise<AccountAggregate> {
+  const since = args.since ? toDate(args.since) : null
+  const until = args.until ? toDate(args.until) : null
+  type Row = {
+    cnt: string
+    sum_credit: string
+    sum_debit: string
+    min_amount: string | null
+    max_amount: string | null
+  }
+  const [row] = await tx<Row[]>`
+    select
+      count(p.id)::text as cnt,
+      coalesce(sum(case when p.direction = 'C' then p.amount else 0 end), 0)::text as sum_credit,
+      coalesce(sum(case when p.direction = 'D' then p.amount else 0 end), 0)::text as sum_debit,
+      min(p.amount)::text as min_amount,
+      max(p.amount)::text as max_amount
+    from "postings" p
+    join "accounts" a on a.id = p.account_id
+    where p.tenant_id = ${tenantId}
+      and a.owner_actor_type = ${account.actor.type}
+      and a.owner_actor_id = ${account.actor.id}
+      and a.name = ${account.name}
+      and a.currency = ${account.currency}
+      ${since ? tx`and p.occurred_at >= ${since}` : tx``}
+      ${until ? tx`and p.occurred_at < ${until}` : tx``}
+  `
+  return {
+    count: Number(row?.cnt ?? '0'),
+    sumCredit: BigInt(row?.sum_credit ?? '0'),
+    sumDebit: BigInt(row?.sum_debit ?? '0'),
+    minAmount: row?.min_amount ? BigInt(row.min_amount) : null,
+    maxAmount: row?.max_amount ? BigInt(row.max_amount) : null,
+  }
+}
+
+async function verifyRecord(
+  tx: SqlTransaction,
+  tenantId: string,
+  txnId: string,
+  hasher: Hasher,
+): Promise<VerifyResult> {
+  const transitions = await tx<Record<string, unknown>[]>`
+    select * from "txn_transitions"
+    where tenant_id = ${tenantId} and txn_id = ${txnId}
+    order by id asc
+  `
+  const issues: {
+    transitionId: string
+    check: 'hash_chain_break' | 'checksum_mismatch'
+    expected: string
+    observed: string
+  }[] = []
+  let prevHash: Buffer | null = null
+
+  for (const t of transitions) {
+    const id = t['id'] as string
+    const storedRowHash = Buffer.from(t['row_hash'] as Buffer)
+    const storedPrev = (t['prev_hash'] as Buffer | null) ?? null
+    const storedChecksum = Buffer.from(t['postings_checksum'] as Buffer)
+
+    const expectedPrev = prevHash
+    const storedPrevBuf = storedPrev ? Buffer.from(storedPrev) : null
+    const prevMismatch = !buffersEqual(storedPrevBuf, expectedPrev)
+
+    const content: CanonicalValue = {
+      id,
+      txn_id: t['txn_id'] as string,
+      tenant_id: t['tenant_id'] as string,
+      type: t['type'] as string,
+      from_state: (t['from_state'] as string | null) ?? null,
+      to_state: t['to_state'] as string,
+      name: t['name'] as string,
+      schema_version: t['schema_version'] as number,
+      actor_type: t['actor_type'] as string,
+      actor_id: t['actor_id'] as string,
+      payload: ((t['payload'] as CanonicalValue) ?? {}) as CanonicalValue,
+      idempotency_key: t['idempotency_key'] as string,
+      occurred_at: t['occurred_at'] as Date,
+      reverses: (t['reverses'] as string | null) ?? null,
+    }
+    const recomputed = computeRowHash(hasher, content, expectedPrev)
+    if (prevMismatch || !storedRowHash.equals(recomputed)) {
+      issues.push({
+        transitionId: id,
+        check: 'hash_chain_break',
+        expected: recomputed.toString('hex'),
+        observed: storedRowHash.toString('hex'),
+      })
+    }
+
+    const postings = await tx<{ account_id: string; direction: string; amount: string }[]>`
+      select account_id, direction, amount::text as amount from "postings"
+      where transition_id = ${id}
+    `
+    const recomputedChecksum = computePostingsChecksum(
+      hasher,
+      postings.map((p) => ({
+        account_id: p.account_id,
+        direction: p.direction,
+        amount: BigInt(p.amount),
+      })),
+    )
+    if (!storedChecksum.equals(recomputedChecksum)) {
+      issues.push({
+        transitionId: id,
+        check: 'checksum_mismatch',
+        expected: recomputedChecksum.toString('hex'),
+        observed: storedChecksum.toString('hex'),
+      })
+    }
+
+    prevHash = storedRowHash
+  }
+
+  return {
+    ok: issues.length === 0,
+    recordId: txnId,
+    transitionsChecked: transitions.length,
+    issues,
+  }
+}
+
+function buffersEqual(a: Buffer | null, b: Buffer | null): boolean {
+  if (a === null && b === null) return true
+  if (a === null || b === null) return false
+  return a.equals(b)
+}
+
+// =============================================================================
+// Page-pack helpers
+// =============================================================================
 
 function makeCursor(cursor: readonly [Date, string]): string {
   return encodeCursor(cursor[0], cursor[1])

@@ -105,7 +105,7 @@ export function createEngine(options: EngineOptions): Engine {
   const migrations: readonly MigrationPlan[] = [
     planInitialMigration(options.schema, options.migration),
   ]
-  const migrator = createMigrator(connection)
+  const migrator = createMigrator(connection, hooks)
 
   const adapterRegistry = new Map<string, AdapterContract>()
 
@@ -177,7 +177,7 @@ export function createEngine(options: EngineOptions): Engine {
 
   const engine: Engine = {
     schema: options.schema,
-    admin: buildAdminOps(connection),
+    admin: buildAdminOps(connection, hooks),
     hooks,
     outbox,
     reconciler,

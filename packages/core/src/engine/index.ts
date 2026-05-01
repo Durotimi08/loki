@@ -1,7 +1,10 @@
 // Public surface for the engine.
 
 export { buildAdminOps } from './admin.js'
-export type { AdminOps, TenantOps } from './admin.js'
+export type { AdminOps, TenantOps, TenantSnapshot } from './admin.js'
+
+export { isSagaSuccess, runSaga } from './saga.js'
+export type { SagaContext, SagaOptions, SagaResult, SagaStep } from './saga.js'
 
 export { buildAccountOps } from './accounts.js'
 export type { AccountOps } from './accounts.js'
@@ -20,6 +23,9 @@ export type { Cursor, Order, Page } from './cursor.js'
 
 export { buildQueryOps } from './queries.js'
 export type {
+  AccountAggregate,
+  AccountAggregateArgs,
+  AccountAggregateMetric,
   AccountHistoryArgs,
   AccountQueryOps,
   ActorScopedOps,
@@ -33,6 +39,7 @@ export type {
   FindManyTransactionsArgs,
   FindManyTransitionsArgs,
   QueryOps,
+  VerifyResult,
 } from './queries.js'
 
 export { openConnection } from './connection.js'
@@ -69,8 +76,13 @@ export type {
   Handler as HookHandler,
   HookFailureEvent,
   HookRegistry,
+  IntegrityViolationEvent,
   OutboxFailureTerminalEvent,
   QuarantineEvent,
+  ReconciliationCompleteEvent,
+  ReversalEvent,
+  SchemaMigrationEvent,
+  TenantLifecycleEvent,
   Unsubscribe as HookUnsubscribe,
 } from './hooks.js'
 
@@ -108,7 +120,7 @@ export type { AppliedMigration, Migrator, MigratorStatus } from './migrator.js'
 export { TENANT_GUC as ENGINE_TENANT_GUC } from '../db/rls.js'
 
 export { buildRecordOps } from './records.js'
-export type { RecordOps } from './records.js'
+export type { BulkTransitionItem, RecordOps } from './records.js'
 
 export type {
   AccountIdentity,

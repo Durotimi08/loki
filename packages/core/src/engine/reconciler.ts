@@ -32,11 +32,24 @@ export type RunOnceOptions = {
   readonly tenantId?: string
   /** If true, marks records `compromised` on integrity-class anomalies. Default true. */
   readonly quarantine?: boolean
+  /**
+   * If true, recomputes `accounts.balance` from postings whenever a
+   * `balance_drift` anomaly is detected. The anomaly is still recorded
+   * and routed through `onAnomaly`, but the cached column is also
+   * brought back in line — drift is the only "recoverable" anomaly
+   * the engine can fix without guessing (postings are the source of
+   * truth; balance is just a cache). Default `false`. (§5.3.4)
+   */
+  readonly repairBalanceDrift?: boolean
 }
 
 export type RunOnceResult = {
   readonly anomalies: readonly AnomalyEvent[]
   readonly quarantined: readonly string[]
+  /** Account ids whose `balance` column the reconciler rebuilt this pass. */
+  readonly repaired: readonly string[]
+  /** Keys whose `expires_at` had passed and were flipped from `active` → `expired`. */
+  readonly expiredKeys: number
 }
 
 export type StartOptions = {
@@ -67,28 +80,73 @@ export type ReconcilerContext = {
 export function createReconciler(ctx: ReconcilerContext): Reconciler {
   return {
     async runOnce(options = {}) {
+      const startedAt = new Date()
       const quarantine = options.quarantine ?? true
       const drafts: AnomalyDraft[] = []
       const integrityRecordIds: string[] = []
 
+      const driftAccountIds = new Set<string>()
+      let expiredKeys = 0
       await ctx.connection.asAdmin(async (tx) => {
         const tenantFilter = options.tenantId
 
-        await checkBalanceDrift(tx, tenantFilter, drafts)
+        // Janitor: flip stale active keys to `expired` before any check
+        // runs so the rest of the sweep sees consistent state. This is
+        // the right layer for the side-effect — the engine's transition
+        // path can only refuse (its tx rolls back the flip).
+        const expired = tenantFilter
+          ? await tx<{ id: string }[]>`
+              update "txn_keys"
+              set status = 'expired'
+              where tenant_id = ${tenantFilter}
+                and status = 'active'
+                and expires_at is not null
+                and expires_at <= now()
+              returning id
+            `
+          : await tx<{ id: string }[]>`
+              update "txn_keys"
+              set status = 'expired'
+              where status = 'active'
+                and expires_at is not null
+                and expires_at <= now()
+              returning id
+            `
+        expiredKeys = expired.length
+
+        const driftIds = await checkBalanceDrift(tx, tenantFilter, drafts)
+        for (const id of driftIds) driftAccountIds.add(id)
         await checkUnbalancedPostings(tx, tenantFilter, drafts)
         await checkPostingsChecksum(tx, tenantFilter, ctx.hasher, drafts)
         const integrityIds = await checkHashChain(tx, tenantFilter, ctx.hasher, drafts)
         integrityRecordIds.push(...integrityIds)
         await checkStateMismatch(tx, tenantFilter, drafts)
+        await checkFabricatedKeys(tx, tenantFilter, drafts)
       })
 
-      // Persist anomalies + quarantine in a second admin tx so even
-      // partial check failures still get recorded.
+      // Persist anomalies + quarantine + auto-repair in a second admin
+      // tx so even partial check failures still get recorded.
       const anomalies: AnomalyEvent[] = []
       const quarantined = new Set<string>()
+      const repaired = new Set<string>()
       await ctx.connection.asAdmin(async (tx) => {
         for (const d of drafts) {
           anomalies.push(await recordAnomaly(tx, d))
+        }
+        if (options.repairBalanceDrift && driftAccountIds.size > 0) {
+          for (const accountId of driftAccountIds) {
+            const [row] = await tx<{ id: string }[]>`
+              update "accounts"
+              set balance = coalesce(
+                (select sum(case when p.direction = 'C' then p.amount else -p.amount end)
+                 from "postings" p where p.account_id = "accounts".id),
+                0
+              )
+              where id = ${accountId}
+              returning id
+            `
+            if (row) repaired.add(row.id)
+          }
         }
         if (quarantine) {
           // Quarantine triggers when a record has at least one
@@ -116,6 +174,9 @@ export function createReconciler(ctx: ReconcilerContext): Reconciler {
       // that triggered them so consumers can route by severity.
       for (const a of anomalies) {
         await ctx.hooks.internals.fireAnomaly(a)
+        if (a.severity === 'critical') {
+          await ctx.hooks.internals.fireIntegrityViolation(a)
+        }
       }
       for (const id of quarantined) {
         // Pair each quarantined record with the most-critical anomaly
@@ -131,7 +192,23 @@ export function createReconciler(ctx: ReconcilerContext): Reconciler {
         await ctx.hooks.internals.fireQuarantine(event)
       }
 
-      return { anomalies, quarantined: Array.from(quarantined) }
+      const result: RunOnceResult = {
+        anomalies,
+        quarantined: Array.from(quarantined),
+        repaired: Array.from(repaired),
+        expiredKeys,
+      }
+      await ctx.hooks.internals.fireReconciliationComplete({
+        startedAt,
+        finishedAt: new Date(),
+        anomaliesFound: anomalies.length,
+        quarantined: result.quarantined.length,
+        ...(options.tenantId !== undefined ? { tenantId: options.tenantId } : {}),
+        // Watermark-aware sweeps land later in this batch; until then
+        // every pass is a full sweep.
+        fullSweep: true,
+      })
+      return result
     },
 
     start(options = {}) {
@@ -194,7 +271,7 @@ async function checkBalanceDrift(
   tx: SqlTransaction,
   tenantFilter: string | undefined,
   drafts: AnomalyDraft[],
-): Promise<void> {
+): Promise<readonly string[]> {
   type Row = {
     id: string
     tenant_id: string
@@ -227,8 +304,10 @@ async function checkBalanceDrift(
         from "accounts" a
       `
 
+  const drifted: string[] = []
   for (const row of rows) {
     if (row.cached !== row.expected) {
+      drifted.push(row.id)
       drafts.push({
         tenantId: row.tenant_id,
         check: 'balance_drift',
@@ -242,6 +321,56 @@ async function checkBalanceDrift(
         },
       })
     }
+  }
+  return drifted
+}
+
+async function checkFabricatedKeys(
+  tx: SqlTransaction,
+  tenantFilter: string | undefined,
+  drafts: AnomalyDraft[],
+): Promise<void> {
+  // A `txn_keys` row is fabricated when (a) its `granted_by_transition_id`
+  // doesn't reference an existing transition, OR (b) the granting
+  // transition exists but doesn't actually `unlock` this key name in
+  // its declared payload — the `txn_transitions` row's `name` would
+  // need to be a transition that mints the key. We catch (a) here at
+  // the SQL level; (b) requires schema introspection and is left for
+  // a later pass.
+  type Row = {
+    id: string
+    tenant_id: string
+    txn_id: string
+    name: string
+    granted_by_transition_id: string
+  }
+  const rows = tenantFilter
+    ? await tx<Row[]>`
+        select k.id, k.tenant_id, k.txn_id, k.name, k.granted_by_transition_id
+        from "txn_keys" k
+        where k.tenant_id = ${tenantFilter}
+          and k.status = 'active'
+          and not exists (
+            select 1 from "txn_transitions" t where t.id = k.granted_by_transition_id
+          )
+      `
+    : await tx<Row[]>`
+        select k.id, k.tenant_id, k.txn_id, k.name, k.granted_by_transition_id
+        from "txn_keys" k
+        where k.status = 'active'
+          and not exists (
+            select 1 from "txn_transitions" t where t.id = k.granted_by_transition_id
+          )
+      `
+  for (const row of rows) {
+    drafts.push({
+      tenantId: row.tenant_id,
+      check: 'fabricated_key',
+      txnId: row.txn_id,
+      expected: { granted_by_transition_id: row.granted_by_transition_id, status: 'absent' },
+      observed: { granted_by_transition_id: row.granted_by_transition_id, status: 'active' },
+      context: { keyId: row.id, keyName: row.name },
+    })
   }
 }
 

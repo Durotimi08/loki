@@ -11,7 +11,9 @@ import type {
 } from './types.js'
 import { NONE_STATE } from './types.js'
 
-const RESERVED_NAMES = new Set(['__none__', '_kind', 'meta'])
+// `_init` is reserved for the synthetic genesis transition emitted by
+// `Engine.create()`; user schemas can't redefine it.
+const RESERVED_NAMES = new Set(['__none__', '_kind', 'meta', '_init'])
 const NAME_REGEX = /^[A-Za-z][A-Za-z0-9_]*$/
 
 export type ValidateOptions = {
@@ -270,6 +272,11 @@ function validateTransactionTransitions(
         `Transition name "${transitionName}" must match ${NAME_REGEX}.`,
         [...tpath],
       )
+    }
+    if (RESERVED_NAMES.has(transitionName)) {
+      ctx.add('reserved_name', `Transition name "${transitionName}" is reserved by the engine.`, [
+        ...tpath,
+      ])
     }
     if (seenNames.has(transitionName)) {
       ctx.add(

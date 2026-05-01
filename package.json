@@ -13,6 +13,8 @@
     "build": "pnpm -r --filter \"./packages/*\" build",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:integration": "LOKI_INTEGRATION=1 vitest run",
+    "test:all": "LOKI_INTEGRATION=1 vitest run",
     "test:types": "vitest --typecheck.only run",
     "typecheck": "pnpm -r --filter \"./packages/*\" typecheck",
     "format": "biome format --write .",

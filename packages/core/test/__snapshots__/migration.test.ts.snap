@@ -114,6 +114,7 @@ CREATE TABLE "txn_records" (
   "state"                   text NOT NULL,
   "version"                 int NOT NULL DEFAULT 0,
   "active_keys"             jsonb NOT NULL DEFAULT '[]'::jsonb,
+  "participants"            jsonb NOT NULL DEFAULT '{}'::jsonb,
   "created_by_actor_type"   text NOT NULL,
   "created_by_actor_id"     text NOT NULL,
   "compromised"             boolean NOT NULL DEFAULT FALSE,
@@ -146,13 +147,15 @@ CREATE TABLE "txn_transitions" (
   "reverses"            text REFERENCES "txn_transitions"("id") ON DELETE RESTRICT,
   "occurred_at"         timestamptz NOT NULL DEFAULT now(),
   CHECK (
-         ("type" = 'DeliveryPayment' AND "name" IN ('pay', 'cancel', 'refund'))
+         ("name" = '_init')
+      OR ("type" = 'DeliveryPayment' AND "name" IN ('pay', 'cancel', 'refund'))
        ),
   CHECK (
-         ("type" = 'DeliveryPayment' AND ("from_state" IN ('pending', 'completed')))
+         "from_state" IS NULL
+      OR ("type" = 'DeliveryPayment' AND ("from_state" IN ('pending', 'completed')))
        ),
   CHECK (
-         ("type" = 'DeliveryPayment' AND "to_state" IN ('completed', 'failed', 'refunded'))
+         ("type" = 'DeliveryPayment' AND "to_state" IN ('pending', 'completed', 'failed', 'refunded'))
        ),
   UNIQUE ("tenant_id", "txn_id", "idempotency_key")
 );

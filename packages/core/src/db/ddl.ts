@@ -107,6 +107,7 @@ function buildTxnRecordsTable(schema: SchemaDef, t: TableNamer): string {
     `${ident('state')}                   text NOT NULL`,
     `${ident('version')}                 int NOT NULL DEFAULT 0`,
     `${ident('active_keys')}             jsonb NOT NULL DEFAULT '[]'::jsonb`,
+    `${ident('participants')}            jsonb NOT NULL DEFAULT '{}'::jsonb`,
     `${ident('created_by_actor_type')}   text NOT NULL`,
     `${ident('created_by_actor_id')}     text NOT NULL`,
     `${ident('compromised')}             boolean NOT NULL DEFAULT FALSE`,
@@ -128,13 +129,18 @@ function buildTxnRecordsTable(schema: SchemaDef, t: TableNamer): string {
 }
 
 function buildTxnTransitionsTable(schema: SchemaDef, t: TableNamer): string {
+  // `_init` is the synthetic genesis transition emitted by `Engine.create()`.
+  // Allowing it universally keeps idempotency uniform between record-creation
+  // and subsequent transitions, with a single audit trail.
   const transitionChecks = schema.transactions
     .filter((tx) => Object.keys(tx.transitions).length > 0)
     .map((tx) => {
       const names = Object.keys(tx.transitions)
       return `(${ident('type')} = ${literalString(tx.name)} AND ${ident('name')} IN ${inList(names)})`
     })
-    .join('\n      OR ')
+  const initBranch = `(${ident('name')} = '_init')`
+  const allTransitionChecks =
+    transitionChecks.length > 0 ? [initBranch, ...transitionChecks].join('\n      OR ') : initBranch
 
   const fromStateChecks = buildFromStateChecks(schema)
   const toStateChecks = buildToStateChecks(schema)
@@ -162,11 +168,13 @@ function buildTxnTransitionsTable(schema: SchemaDef, t: TableNamer): string {
     `${ident('reverses')}            text REFERENCES ${t('txn_transitions')}(${ident('id')}) ON DELETE RESTRICT`,
     `${ident('occurred_at')}         timestamptz NOT NULL DEFAULT now()`,
   ]
-  if (transitionChecks.length > 0) {
-    lines.push(`CHECK (\n         ${transitionChecks}\n       )`)
-  }
+  lines.push(`CHECK (\n         ${allTransitionChecks}\n       )`)
   if (fromStateChecks.length > 0) {
-    lines.push(`CHECK (\n         ${fromStateChecks}\n       )`)
+    // `from_state IS NULL` is allowed unconditionally — that's the
+    // genesis `_init` transition. The per-type list narrows the rest.
+    lines.push(
+      `CHECK (\n         ${ident('from_state')} IS NULL\n      OR ${fromStateChecks}\n       )`,
+    )
   }
   if (toStateChecks.length > 0) {
     lines.push(`CHECK (\n         ${toStateChecks}\n       )`)
@@ -327,8 +335,13 @@ function buildFromStateChecks(schema: SchemaDef): string {
 function buildToStateChecks(schema: SchemaDef): string {
   const parts: string[] = []
   for (const tx of schema.transactions) {
+    // Include `initial` so the synthetic `_init` genesis transition
+    // (which writes to_state = initial) satisfies the check.
     const tos = Array.from(
-      new Set((Object.values(tx.transitions) as TransitionDef[]).map((tr) => tr.to)),
+      new Set([
+        tx.initial,
+        ...(Object.values(tx.transitions) as TransitionDef[]).map((tr) => tr.to),
+      ]),
     )
     if (tos.length > 0) {
       parts.push(

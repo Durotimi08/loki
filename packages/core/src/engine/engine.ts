@@ -5,7 +5,10 @@ import { type AdminOps, buildAdminOps } from './admin.js'
 import { type TenantClient, buildTenantClient } from './client.js'
 import { type Connection, type ConnectionInput, openConnection } from './connection.js'
 import { type Hasher, sha256Hasher } from './hash.js'
+import { type HookRegistry, createHookRegistry } from './hooks.js'
 import { type Migrator, createMigrator } from './migrator.js'
+import { type OutboxOps, buildOutboxOps } from './outbox.js'
+import { type Reconciler, createReconciler } from './reconciler.js'
 
 export type EngineOptions = {
   /** The compiled schema. */
@@ -21,6 +24,15 @@ export type EngineOptions = {
 export type Engine = {
   readonly schema: SchemaDef
   readonly admin: AdminOps
+  /**
+   * In-process hook registry. Register `beforeTransition`,
+   * `afterTransition`, `onAnomaly`, etc. handlers here. See `HookRegistry`.
+   */
+  readonly hooks: HookRegistry
+  /** Outbox worker — drain `emit`-ed events to webhooks/queues. */
+  readonly outbox: OutboxOps
+  /** Reconciler — runs the §5.2 integrity checks. */
+  readonly reconciler: Reconciler
   /** Get a tenant-scoped client. */
   forTenant(tenantId: string): TenantClient
   /** Apply pending migrations (currently just the bootstrap plan). */
@@ -45,20 +57,28 @@ export type Engine = {
 export function createEngine(options: EngineOptions): Engine {
   const connection = openConnection(options.connection)
   const hasher = options.hasher ?? sha256Hasher
+  const hooks = createHookRegistry()
   const migrations: readonly MigrationPlan[] = [
     planInitialMigration(options.schema, options.migration),
   ]
   const migrator = createMigrator(connection)
 
+  const outbox = buildOutboxOps(connection, hooks)
+  const reconciler = createReconciler({ connection, hasher, hooks })
+
   return {
     schema: options.schema,
     admin: buildAdminOps(connection),
+    hooks,
+    outbox,
+    reconciler,
     forTenant(tenantId: string) {
       return buildTenantClient({
         schema: options.schema,
         tenantId,
         connection,
         hasher,
+        hooks,
       })
     },
     async migrate() {

@@ -96,7 +96,9 @@ export function buildIndexesSql(options: ResolvedMigrationOptions): string[] {
 `,
   )
 
-  // outbox: worker drain (partial)
+  // outbox: worker drain (partial — excludes both delivered AND
+  // terminally-failed rows so the worker only ever sees actionable
+  // events).
   stmts.push(
     `CREATE INDEX ${ix('outbox_drain_idx')}
   ON ${t('outbox')} (
@@ -104,7 +106,7 @@ export function buildIndexesSql(options: ResolvedMigrationOptions): string[] {
     ${ident('next_attempt_at')},
     ${ident('id')}
   )
-  WHERE ${ident('delivered_at')} IS NULL;
+  WHERE ${ident('delivered_at')} IS NULL AND ${ident('failed_at')} IS NULL;
 `,
   )
 

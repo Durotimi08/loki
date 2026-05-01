@@ -16,6 +16,7 @@ import {
   UnknownTransitionError,
 } from './errors.js'
 import { type Hasher, computePostingsChecksum, computeRowHash } from './hash.js'
+import type { HookRegistry } from './hooks.js'
 import type {
   AccountIdentity,
   ActorRef,
@@ -57,6 +58,7 @@ export type RecordOpsContext = {
   readonly tenantId: string
   readonly connection: Connection
   readonly hasher: Hasher
+  readonly hooks: HookRegistry
 }
 
 const GENESIS_NAME = '_init'
@@ -67,7 +69,7 @@ function isUuid(value: string): boolean {
 }
 
 export function buildRecordOps(ctx: RecordOpsContext): RecordOps {
-  const { schema, tenantId, connection, hasher } = ctx
+  const { schema, tenantId, connection, hasher, hooks } = ctx
 
   return {
     async create(input) {
@@ -82,7 +84,7 @@ export function buildRecordOps(ctx: RecordOpsContext): RecordOps {
       const participants = input.participants ?? {}
       validateParticipants(txn, participants)
 
-      return connection.withTenant(tenantId, async (tx) => {
+      const result = await connection.withTenant(tenantId, async (tx) => {
         // Idempotency probe — look up an existing genesis transition
         // matching this tenant + key.
         const existing = await findExistingTransition(tx, tenantId, input.idempotencyKey)
@@ -93,7 +95,7 @@ export function buildRecordOps(ctx: RecordOpsContext): RecordOps {
               `Idempotent replay found genesis transition ${existing.id} but record ${existing.txn_id} is missing.`,
             )
           }
-          return { record, replayed: true }
+          return { record, replayed: true, transitionId: existing.id }
         }
 
         const recordId = await insertRecord(tx, tenantId, txn, input.by, participants)
@@ -135,8 +137,30 @@ export function buildRecordOps(ctx: RecordOpsContext): RecordOps {
 
         const record = await loadRecord(tx, tenantId, recordId)
         if (!record) throw new LokiError('Record vanished mid-transaction.')
-        return { record, replayed: false }
+        return { record, replayed: false, transitionId }
       })
+
+      // Fire afterTransition for the synthetic _init genesis. The
+      // post-commit invocation lets webhooks/log fan-out latch onto
+      // record creation through the same hook surface as regular
+      // transitions.
+      if (!result.replayed) {
+        const trail = await connection.withTenant(tenantId, (tx) =>
+          loadTransition(tx, tenantId, result.transitionId),
+        )
+        if (trail) {
+          await hooks.internals.fireAfterTransition({
+            tenantId,
+            record: result.record,
+            transition: trail,
+            txnType: result.record.type,
+            transitionName: GENESIS_NAME,
+            unlocked: {},
+          })
+        }
+      }
+
+      return { record: result.record, replayed: result.replayed }
     },
 
     async transition(input) {
@@ -168,9 +192,9 @@ async function runTransition(
   ctx: RecordOpsContext,
   input: TransitionInputArgs,
 ): Promise<TransitionResult> {
-  const { schema, tenantId, connection, hasher } = ctx
+  const { schema, tenantId, connection, hasher, hooks } = ctx
 
-  return connection.withTenant(tenantId, async (tx) => {
+  const result = await connection.withTenant(tenantId, async (tx) => {
     // ---- 1. Idempotency probe ---------------------------------------------
     const existing = await findExistingTransition(tx, tenantId, input.idempotencyKey)
     if (existing && existing.txn_id === input.id) {
@@ -278,8 +302,27 @@ async function runTransition(
       }
     }
 
+    // ---- 6.5. beforeTransition hook (pre-commit) -------------------------
+    // Fires after all validation but before any writes — a throw here
+    // rolls back the entire tx with no side effects on the DB. This is
+    // the application's last chance to abort cleanly.
+    await hooks.internals.fireBeforeTransition({
+      tenantId,
+      record,
+      txnType: record.type,
+      transitionName: input.name,
+      actor: input.by,
+      data,
+      idempotencyKey: input.idempotencyKey,
+      ...(input.traceId !== undefined ? { traceId: input.traceId } : {}),
+    })
+
     // ---- 7. Compute hash chain --------------------------------------------
     const prevHash = await loadLatestRowHash(tx, tenantId, record.id)
+    // Hash the JSON-storage form of the payload — same form the
+    // reconciler reads back from `txn_transitions.payload`. Hashing the
+    // raw bigint object would diverge from the recomputation and
+    // produce false `hash_chain_break` anomalies.
     const content: CanonicalValue = {
       id: transitionId,
       txn_id: record.id,
@@ -291,7 +334,7 @@ async function runTransition(
       schema_version: record.schemaVersion,
       actor_type: input.by.type,
       actor_id: input.by.id,
-      payload: data as CanonicalValue,
+      payload: jsonifyForStorage(data) as CanonicalValue,
       idempotency_key: input.idempotencyKey,
       occurred_at: occurredAt,
       reverses: null,
@@ -417,6 +460,22 @@ async function runTransition(
       replayed: false,
     }
   })
+
+  // afterTransition fires once the DB tx has committed. Errors are
+  // isolated and routed to onHookFailure so a slow webhook never
+  // affects the engine's response time.
+  if (!result.replayed) {
+    await hooks.internals.fireAfterTransition({
+      tenantId,
+      record: result.record,
+      transition: result.transition,
+      txnType: result.record.type,
+      transitionName: result.transition.name,
+      unlocked: result.unlocked,
+    })
+  }
+
+  return result
 }
 
 // =============================================================================

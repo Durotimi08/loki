@@ -191,6 +191,7 @@ CREATE TABLE "outbox" (
   "intent"              text,
   "payload"             jsonb NOT NULL DEFAULT '{}'::jsonb,
   "delivered_at"        timestamptz,
+  "failed_at"           timestamptz,
   "attempts"            int NOT NULL DEFAULT 0,
   "next_attempt_at"     timestamptz NOT NULL DEFAULT now(),
   "last_error"          text,
@@ -272,7 +273,7 @@ CREATE INDEX "outbox_drain_idx"
     "next_attempt_at",
     "id"
   )
-  WHERE "delivered_at" IS NULL;
+  WHERE "delivered_at" IS NULL AND "failed_at" IS NULL;
 
 CREATE INDEX "txn_anomalies_severity_idx"
   ON "txn_anomalies" (

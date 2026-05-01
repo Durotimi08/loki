@@ -2,6 +2,7 @@ import type { SchemaDef } from '../schema/types.js'
 import { type AccountOps, buildAccountOps } from './accounts.js'
 import type { Connection } from './connection.js'
 import type { Hasher } from './hash.js'
+import type { HookRegistry } from './hooks.js'
 import { type RecordOps, buildRecordOps } from './records.js'
 
 /**
@@ -28,6 +29,7 @@ export function buildTenantClient(opts: {
   tenantId: string
   connection: Connection
   hasher: Hasher
+  hooks: HookRegistry
 }): TenantClient {
   return {
     tenantId: opts.tenantId,
@@ -37,6 +39,7 @@ export function buildTenantClient(opts: {
       tenantId: opts.tenantId,
       connection: opts.connection,
       hasher: opts.hasher,
+      hooks: opts.hooks,
     }),
   }
 }

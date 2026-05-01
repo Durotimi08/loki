@@ -246,6 +246,7 @@ function buildOutboxTable(schema: SchemaDef, t: TableNamer): string {
     `${ident('intent')}              text`,
     `${ident('payload')}             jsonb NOT NULL DEFAULT '{}'::jsonb`,
     `${ident('delivered_at')}        timestamptz`,
+    `${ident('failed_at')}           timestamptz`,
     `${ident('attempts')}            int NOT NULL DEFAULT 0`,
     `${ident('next_attempt_at')}     timestamptz NOT NULL DEFAULT now()`,
     `${ident('last_error')}          text`,

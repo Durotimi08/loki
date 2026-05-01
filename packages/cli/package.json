@@ -1,0 +1,28 @@
+{
+  "name": "@loki/cli",
+  "version": "0.0.0",
+  "description": "Loki CLI — schema migrations, codegen, reconciliation.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "loki": "./dist/index.js"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist", "src"],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --clean",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@loki/core": "workspace:*"
+  },
+  "devDependencies": {
+    "tsup": "^8.3.5",
+    "typescript": "^5.6.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

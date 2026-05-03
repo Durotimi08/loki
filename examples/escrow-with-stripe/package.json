@@ -1,0 +1,22 @@
+{
+  "name": "loki-example-escrow-with-stripe",
+  "version": "0.0.0",
+  "private": true,
+  "description": "End-to-end escrow flow for @loki/core. Adapter (mocked Stripe), holds, disputes, multi-currency settlement via the FX rate hook. Three flows: happy path, failed auth, dispute → reverse.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "migrate": "tsx src/migrate.ts",
+    "start": "tsx src/main.ts"
+  },
+  "dependencies": {
+    "@loki/adapter-mocked": "workspace:*",
+    "@loki/adapter-sdk": "workspace:*",
+    "@loki/core": "workspace:*",
+    "@standard-schema/spec": "1.0.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.3"
+  }
+}

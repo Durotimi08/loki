@@ -121,6 +121,40 @@ export function buildIndexesSql(options: ResolvedMigrationOptions): string[] {
 `,
   )
 
+  // txn_scheduled: scheduler tick — only `pending` rows are interesting,
+  // ordered by run_at so each batch claims the next due window.
+  stmts.push(
+    `CREATE INDEX ${ix('txn_scheduled_due_idx')}
+  ON ${t('txn_scheduled')} (
+    ${ident('tenant_id')},
+    ${ident('run_at')},
+    ${ident('id')}
+  )
+  WHERE ${ident('status')} = 'pending';
+`,
+  )
+
+  // Idempotent record creation (§6.2 race-safety): genesis (`_init`)
+  // transitions must be unique per (tenant, idempotency_key) so two
+  // concurrent `create()` calls converge on the same record. The
+  // record-scoped UNIQUE on the table itself is what protects
+  // post-genesis transitions, where each record is already known.
+  //
+  // Skipped in partitioned mode — Postgres requires every unique
+  // constraint on a partitioned table to include the partition key
+  // (`occurred_at`), and that defeats idempotency (two concurrent
+  // `now()` values are practically distinct). Operators running with
+  // `partitioning: 'monthly'` should serialise concurrent creates at
+  // the application layer or pre-allocate record ids.
+  if (options.partitioning !== 'monthly') {
+    stmts.push(
+      `CREATE UNIQUE INDEX ${ix('txn_transitions_init_idem_idx')}
+  ON ${t('txn_transitions')} (${ident('tenant_id')}, ${ident('idempotency_key')})
+  WHERE ${ident('name')} = '_init';
+`,
+    )
+  }
+
   return stmts.map(trimSql)
 }
 
@@ -129,6 +163,8 @@ export function buildDropIndexesSql(options: ResolvedMigrationOptions): string[]
   // Order is irrelevant for DROP INDEX, but reverse-sorting keeps the
   // generated `down` script stable for snapshot tests.
   return [
+    'txn_transitions_init_idem_idx',
+    'txn_scheduled_due_idx',
     'txn_anomalies_severity_idx',
     'outbox_drain_idx',
     'txn_keys_active_idx',

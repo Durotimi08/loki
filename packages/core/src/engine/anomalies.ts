@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { type PayloadCrypto, encryptPayload } from '../primitives/payload-crypto.js'
 import type { SqlTransaction } from './connection.js'
 import type { AnomalyCheckName, AnomalyEvent, AnomalySeverity } from './hooks.js'
 
@@ -14,6 +15,10 @@ export const DEFAULT_SEVERITY: Readonly<Record<AnomalyCheckName, AnomalySeverity
   checksum_mismatch: 'critical',
   state_mismatch: 'error',
   fabricated_key: 'critical',
+  // M16: a rate that disagrees with the FX table within tolerance is
+  // a billing dispute, not an integrity break. The reconciler reports
+  // it as `error` so it surfaces but doesn't quarantine.
+  fx_rate_drift: 'error',
 }
 
 export type AnomalyDraft = {
@@ -31,14 +36,29 @@ export type AnomalyDraft = {
 /**
  * Insert an anomaly row and return the corresponding hook event.
  * Caller is responsible for routing the event to the hook registry.
+ *
+ * When `payloadCrypto` is supplied (M6), the `expected` and `observed`
+ * columns are wrapped in the same `{ "$encrypted": ... }` envelope as
+ * `txn_transitions.payload`. The hook event still carries the
+ * plaintext values — encryption only affects on-disk storage.
  */
 export async function recordAnomaly(
   tx: SqlTransaction,
   draft: AnomalyDraft,
+  payloadCrypto?: PayloadCrypto,
 ): Promise<AnomalyEvent> {
   const id = randomUUID()
   const detectedAt = new Date()
   const severity = draft.severity ?? DEFAULT_SEVERITY[draft.check]
+
+  const expectedJson = toJsonValue(draft.expected)
+  const observedJson = toJsonValue(draft.observed)
+  const expectedStorage = payloadCrypto
+    ? await encryptPayload(payloadCrypto, expectedJson)
+    : expectedJson
+  const observedStorage = payloadCrypto
+    ? await encryptPayload(payloadCrypto, observedJson)
+    : observedJson
 
   await tx`
     insert into "txn_anomalies" (
@@ -51,8 +71,8 @@ export async function recordAnomaly(
       ${draft.check},
       ${draft.txnId ?? null},
       ${draft.accountId ?? null},
-      ${tx.json(toJsonValue(draft.expected) as never)},
-      ${tx.json(toJsonValue(draft.observed) as never)},
+      ${tx.json(expectedStorage as never)},
+      ${tx.json(observedStorage as never)},
       ${severity}
     )
   `

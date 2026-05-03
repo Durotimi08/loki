@@ -1,0 +1,21 @@
+{
+  "name": "@loki/bench",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Performance benchmarks for @loki/core. Measures the §12.1 budgets (transition p99, balance read, reconciler sweep, outbox dispatch) on representative workloads.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "bench": "LOKI_INTEGRATION=1 vitest bench --run --config ./vitest.config.bench.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@loki/core": "workspace:*",
+    "@standard-schema/spec": "1.0.0"
+  },
+  "devDependencies": {
+    "@testcontainers/postgresql": "^10.13.2",
+    "testcontainers": "^10.13.2",
+    "typescript": "^5.6.3"
+  }
+}

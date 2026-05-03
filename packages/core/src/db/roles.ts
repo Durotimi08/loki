@@ -61,7 +61,11 @@ export function buildGrantsSql(options: ResolvedMigrationOptions): string[] {
   ${t('txn_keys')},
   ${t('postings')},
   ${t('outbox')},
-  ${t('txn_anomalies')}
+  ${t('txn_anomalies')},
+  ${t('txn_scheduled')},
+  ${t('fx_rates')},
+  ${t('txn_holds')},
+  ${t('txn_disputes')}
 TO ${admin};
 `,
   )
@@ -76,7 +80,11 @@ TO ${admin};
   ${t('txn_keys')},
   ${t('postings')},
   ${t('outbox')},
-  ${t('txn_anomalies')}
+  ${t('txn_anomalies')},
+  ${t('txn_scheduled')},
+  ${t('fx_rates')},
+  ${t('txn_holds')},
+  ${t('txn_disputes')}
 TO ${app};
 `,
   )
@@ -89,6 +97,22 @@ TO ${app};
   stmts.push(`GRANT INSERT ON ${t('accounts')} TO ${app};\n`)
   stmts.push(`GRANT INSERT ON ${t('txn_records')} TO ${app};\n`)
   stmts.push(`GRANT INSERT ON ${t('txn_keys')} TO ${app};\n`)
+  stmts.push(`GRANT INSERT ON ${t('txn_scheduled')} TO ${app};\n`)
+  stmts.push(`GRANT INSERT ON ${t('fx_rates')} TO ${app};\n`)
+  stmts.push(`GRANT INSERT ON ${t('txn_holds')} TO ${app};\n`)
+  stmts.push(`GRANT INSERT ON ${t('txn_disputes')} TO ${app};\n`)
+  // Holds + disputes both have transition-driven status updates from
+  // the app role; the rest stays admin-only.
+  stmts.push(
+    `GRANT UPDATE (${ident('status')}, ${ident('released_by_transition_id')}, ${ident('released_at')})
+ON ${t('txn_holds')} TO ${app};
+`,
+  )
+  stmts.push(
+    `GRANT UPDATE (${ident('status')}, ${ident('resolved_at')}, ${ident('resolution')})
+ON ${t('txn_disputes')} TO ${app};
+`,
+  )
 
   // --- ledger_app: constrained UPDATE on cache / state columns ---
   // §13: "constrained UPDATE only on txn_records, accounts.balance,
@@ -112,6 +136,14 @@ ON ${t('outbox')} TO ${app};
   stmts.push(
     `GRANT UPDATE (${ident('resolved_at')}, ${ident('resolved_by')}, ${ident('resolution')})
 ON ${t('txn_anomalies')} TO ${app};
+`,
+  )
+  // Scheduler progresses through (status, attempts, last_error, fired_at,
+  // fired_transition_id) — those are the only columns the app role can
+  // touch after insert.
+  stmts.push(
+    `GRANT UPDATE (${ident('status')}, ${ident('attempts')}, ${ident('last_error')}, ${ident('fired_at')}, ${ident('fired_transition_id')})
+ON ${t('txn_scheduled')} TO ${app};
 `,
   )
 

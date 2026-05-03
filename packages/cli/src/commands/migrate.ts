@@ -56,3 +56,59 @@ export async function runMigrate(
     await engine.close()
   }
 }
+
+export type EnforceOptions = {
+  readonly enforcerName: string
+  readonly tenant?: string
+  readonly limit?: number
+}
+
+/**
+ * `loki migrate enforce <name>` (§14.2) — surface records whose stored
+ * transitions violate a newly-introduced invariant. The CLI does NOT
+ * automatically drive reversal transitions; that's the operator's call
+ * (eviction is schema-specific). Output is a list of (recordId,
+ * transitionId, summary) ready to feed into a follow-up script.
+ */
+export async function runMigrateEnforce(
+  config: LokiConfig,
+  options: EnforceOptions,
+  io: Io,
+): Promise<number> {
+  const enforcer = config.enforcers?.[options.enforcerName]
+  if (!enforcer) {
+    io.err(
+      `migrate enforce: no enforcer named "${options.enforcerName}" in loki.config. Add one to \`enforcers: { ... }\`.`,
+    )
+    return 2
+  }
+  const engine = createEngine({
+    schema: config.schema,
+    connection: config.connection,
+    ...(config.migration ? { migration: config.migration } : {}),
+  })
+  try {
+    const hits = await engine.admin.schema.findViolations({
+      ...(options.tenant ? { tenantId: options.tenant } : {}),
+      txnType: enforcer.txnType,
+      ...(enforcer.transitionName ? { transitionName: enforcer.transitionName } : {}),
+      predicate: enforcer.predicate,
+      ...(options.limit ? { limit: options.limit } : {}),
+    })
+    if (enforcer.description) io.out(`# ${enforcer.description}`)
+    if (hits.length === 0) {
+      io.out('No violations found.')
+      return 0
+    }
+    io.out(`Found ${hits.length} violation(s):`)
+    for (const hit of hits) {
+      io.out(
+        `  record=${hit.recordId} transition=${hit.transition.id} name=${hit.transition.name} actor=${hit.transition.actor.type}:${hit.transition.actor.id}`,
+      )
+    }
+    // Exit 1 so CI gates can fail when violations exist.
+    return 1
+  } finally {
+    await engine.close()
+  }
+}

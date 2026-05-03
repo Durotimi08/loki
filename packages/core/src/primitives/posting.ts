@@ -27,7 +27,9 @@ export type Posting = {
 
 /**
  * Sums a list of postings by direction. Used by the engine pre-commit
- * to enforce `sum(D) === sum(C)`.
+ * to enforce `sum(D) === sum(C)`. Aggregates across all currencies —
+ * use `sumByDirectionPerCurrency` for the per-currency view that M16
+ * relies on.
  */
 export function sumByDirection(postings: readonly Posting[]): { debits: bigint; credits: bigint } {
   let debits = 0n
@@ -39,7 +41,28 @@ export function sumByDirection(postings: readonly Posting[]): { debits: bigint; 
   return { debits, credits }
 }
 
+/**
+ * Per-currency sums. The map is keyed by the leg's account currency.
+ * `isBalanced` uses this — `D === C` must hold within each currency,
+ * not just in aggregate, otherwise an FX transition could "balance"
+ * 100 USD against 8500 NGN with no rate metadata anywhere.
+ */
+export function sumByDirectionPerCurrency(
+  postings: readonly Posting[],
+): Map<CurrencyCode, { debits: bigint; credits: bigint }> {
+  const out = new Map<CurrencyCode, { debits: bigint; credits: bigint }>()
+  for (const p of postings) {
+    const slot = out.get(p.account.currency) ?? { debits: 0n, credits: 0n }
+    if (p.direction === 'D') slot.debits += p.amount
+    else slot.credits += p.amount
+    out.set(p.account.currency, slot)
+  }
+  return out
+}
+
 export function isBalanced(postings: readonly Posting[]): boolean {
-  const { debits, credits } = sumByDirection(postings)
-  return debits === credits
+  for (const { debits, credits } of sumByDirectionPerCurrency(postings).values()) {
+    if (debits !== credits) return false
+  }
+  return true
 }

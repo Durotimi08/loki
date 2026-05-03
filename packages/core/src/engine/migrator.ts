@@ -24,6 +24,11 @@ import type { HookRegistry } from './hooks.js'
 
 export const MIGRATIONS_TABLE = '_loki_migrations'
 
+/** Compose the prefixed bookkeeping-table name. M2 fix. */
+export function migrationsTableName(prefix: string): string {
+  return `${prefix}${MIGRATIONS_TABLE}`
+}
+
 export type AppliedMigration = {
   readonly id: string
   readonly checksum: string
@@ -38,62 +43,84 @@ export type MigratorStatus = {
 export type Migrator = {
   /** Apply every plan that hasn't been applied yet. Returns the new applied set. */
   apply(plans: readonly MigrationPlan[]): Promise<readonly AppliedMigration[]>
+  /**
+   * Same as `apply`, but runs against an arbitrary target Connection.
+   * Used by `tenants.provision` to migrate schema-per-tenant or
+   * db-per-tenant deployments. The bookkeeping table lives wherever
+   * the target's tx writes — i.e. in the target schema or DB.
+   */
+  applyOn(target: Connection, plans: readonly MigrationPlan[]): Promise<readonly AppliedMigration[]>
   /** List which plans have been applied vs are still pending. */
   status(plans: readonly MigrationPlan[]): Promise<MigratorStatus>
   /** Tear down a plan. Use with care — drops engine tables. */
   rollback(plan: MigrationPlan): Promise<void>
 }
 
-export function createMigrator(connection: Connection, hooks?: HookRegistry): Migrator {
+export function createMigrator(
+  connection: Connection,
+  hooks?: HookRegistry,
+  options: { tablePrefix?: string } = {},
+): Migrator {
+  const tableName = migrationsTableName(options.tablePrefix ?? '')
+  const applyAgainst = async (
+    target: Connection,
+    plans: readonly MigrationPlan[],
+  ): Promise<readonly AppliedMigration[]> => {
+    const newlyApplied: AppliedMigration[] = []
+    await target.asAdmin(async (tx) => {
+      await ensureMigrationsTable(tx, tableName)
+      const seen = await loadApplied(tx, tableName)
+      for (const plan of plans) {
+        const existing = seen.get(plan.id)
+        const checksum = sha256Hex(plan.toUpSql())
+        if (existing) {
+          if (existing.checksum !== checksum) {
+            throw new MigrationMismatchError(
+              `Migration "${plan.id}" has been applied with a different SQL body. Expected checksum ${existing.checksum}, got ${checksum}. Refusing to re-run.`,
+            )
+          }
+          continue
+        }
+        await applyPlan(tx, plan)
+        const row: AppliedMigration = {
+          id: plan.id,
+          checksum,
+          applied_at: new Date(),
+        }
+        await tx`
+          insert into ${tx(tableName)}
+            (id, checksum, applied_at)
+          values
+            (${row.id}, ${row.checksum}, ${row.applied_at})
+        `
+        newlyApplied.push(row)
+      }
+    })
+    // Hooks fire post-commit so a slow handler can never roll back
+    // a migration that already landed.
+    for (const row of newlyApplied) {
+      await hooks?.internals.fireSchemaMigration({
+        id: row.id,
+        direction: 'up',
+        checksum: row.checksum,
+        appliedAt: row.applied_at,
+      })
+    }
+    return newlyApplied
+  }
+
   return {
     async apply(plans) {
-      const newlyApplied: AppliedMigration[] = []
-      await connection.asAdmin(async (tx) => {
-        await ensureMigrationsTable(tx)
-        const seen = await loadApplied(tx)
-        for (const plan of plans) {
-          const existing = seen.get(plan.id)
-          const checksum = sha256Hex(plan.toUpSql())
-          if (existing) {
-            if (existing.checksum !== checksum) {
-              throw new MigrationMismatchError(
-                `Migration "${plan.id}" has been applied with a different SQL body. Expected checksum ${existing.checksum}, got ${checksum}. Refusing to re-run.`,
-              )
-            }
-            continue
-          }
-          await applyPlan(tx, plan)
-          const row: AppliedMigration = {
-            id: plan.id,
-            checksum,
-            applied_at: new Date(),
-          }
-          await tx`
-            insert into ${tx(MIGRATIONS_TABLE)}
-              (id, checksum, applied_at)
-            values
-              (${row.id}, ${row.checksum}, ${row.applied_at})
-          `
-          newlyApplied.push(row)
-        }
-      })
-      // Hooks fire post-commit so a slow handler can never roll back
-      // a migration that already landed.
-      for (const row of newlyApplied) {
-        await hooks?.internals.fireSchemaMigration({
-          id: row.id,
-          direction: 'up',
-          checksum: row.checksum,
-          appliedAt: row.applied_at,
-        })
-      }
-      return newlyApplied
+      return applyAgainst(connection, plans)
+    },
+    async applyOn(target, plans) {
+      return applyAgainst(target, plans)
     },
 
     async status(plans) {
       return connection.asAdmin(async (tx) => {
-        await ensureMigrationsTable(tx)
-        const seen = await loadApplied(tx)
+        await ensureMigrationsTable(tx, tableName)
+        const seen = await loadApplied(tx, tableName)
         const applied: AppliedMigration[] = []
         const pending: MigrationPlan[] = []
         for (const plan of plans) {
@@ -108,9 +135,9 @@ export function createMigrator(connection: Connection, hooks?: HookRegistry): Mi
     async rollback(plan) {
       const checksum = sha256Hex(plan.toUpSql())
       await connection.asAdmin(async (tx) => {
-        await ensureMigrationsTable(tx)
+        await ensureMigrationsTable(tx, tableName)
         await applyDownSql(tx, plan)
-        await tx`delete from ${tx(MIGRATIONS_TABLE)} where id = ${plan.id}`
+        await tx`delete from ${tx(tableName)} where id = ${plan.id}`
       })
       await hooks?.internals.fireSchemaMigration({
         id: plan.id,
@@ -126,9 +153,9 @@ export function createMigrator(connection: Connection, hooks?: HookRegistry): Mi
 // Helpers
 // =============================================================================
 
-async function ensureMigrationsTable(tx: SqlTransaction): Promise<void> {
+async function ensureMigrationsTable(tx: SqlTransaction, tableName: string): Promise<void> {
   await tx.unsafe(`
-    CREATE TABLE IF NOT EXISTS ${ident(MIGRATIONS_TABLE)} (
+    CREATE TABLE IF NOT EXISTS ${ident(tableName)} (
       id text PRIMARY KEY,
       checksum text NOT NULL,
       applied_at timestamptz NOT NULL DEFAULT now()
@@ -136,9 +163,12 @@ async function ensureMigrationsTable(tx: SqlTransaction): Promise<void> {
   `)
 }
 
-async function loadApplied(tx: SqlTransaction): Promise<Map<string, AppliedMigration>> {
+async function loadApplied(
+  tx: SqlTransaction,
+  tableName: string,
+): Promise<Map<string, AppliedMigration>> {
   const rows = await tx<AppliedMigration[]>`
-    select id, checksum, applied_at from ${tx(MIGRATIONS_TABLE)} order by id
+    select id, checksum, applied_at from ${tx(tableName)} order by id
   `
   const out = new Map<string, AppliedMigration>()
   for (const row of rows) out.set(row.id, row)

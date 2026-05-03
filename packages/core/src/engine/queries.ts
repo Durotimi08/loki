@@ -1,3 +1,4 @@
+import { type PayloadCrypto, decryptPayload } from '../primitives/payload-crypto.js'
 import { mapAccount } from './accounts.js'
 import type { CanonicalValue } from './canonical.js'
 import type { Connection, SqlTransaction } from './connection.js'
@@ -201,33 +202,43 @@ const MAX_LIMIT = 1000
 // Build
 // =============================================================================
 
-export function buildQueryOps(tenantId: string, connection: Connection): QueryOps {
+export type BuildQueryOpsOptions = {
+  /** Auto-decrypt envelope payloads on read paths (M6). */
+  readonly payloadCrypto?: PayloadCrypto
+}
+
+export function buildQueryOps(
+  tenantId: string,
+  connection: Connection,
+  opts: BuildQueryOpsOptions = {},
+): QueryOps {
+  const crypto = opts.payloadCrypto
   return {
     actor(actor: ActorRef): ActorScopedOps {
       return {
         async transactions(args = {}) {
-          return connection.withTenant(tenantId, async (tx) => {
+          return connection.withTenantReplica(tenantId, async (tx) => {
             return await actorTransactions(tx, tenantId, actor, args)
           })
         },
         async summary(args = {}) {
-          return connection.withTenant(tenantId, async (tx) => {
+          return connection.withTenantReplica(tenantId, async (tx) => {
             return await actorSummary(tx, tenantId, actor, args)
           })
         },
         async trails(args = {}) {
-          return connection.withTenant(tenantId, async (tx) => {
+          return connection.withTenantReplica(tenantId, async (tx) => {
             const page = await actorTransactions(tx, tenantId, actor, args)
             const items = []
             for (const record of page.items) {
               const trail = await loadTrail(tx, tenantId, record.id)
-              items.push({ record, trail })
+              items.push({ record, trail: await decryptTransitions(trail, crypto) })
             }
             return { items, nextCursor: page.nextCursor }
           })
         },
         async accounts() {
-          return connection.withTenant(tenantId, async (tx) => {
+          return connection.withTenantReplica(tenantId, async (tx) => {
             return await actorAccounts(tx, tenantId, actor)
           })
         },
@@ -262,14 +273,18 @@ export function buildQueryOps(tenantId: string, connection: Connection): QueryOp
     transitions: {
       async findMany(args = {}) {
         return connection.withTenant(tenantId, async (tx) => {
-          return await findManyTransitions(tx, tenantId, args)
+          const page = await findManyTransitions(tx, tenantId, args)
+          const items = await decryptTransitions(page.items, crypto)
+          return { items, nextCursor: page.nextCursor }
         })
       },
     },
     anomalies: {
       async findMany(args = {}) {
         return connection.withTenant(tenantId, async (tx) => {
-          return await findManyAnomalies(tx, tenantId, args)
+          const page = await findManyAnomalies(tx, tenantId, args)
+          const items = await decryptAnomalies(page.items, crypto)
+          return { items, nextCursor: page.nextCursor }
         })
       },
     },
@@ -282,10 +297,39 @@ export function buildQueryOps(tenantId: string, connection: Connection): QueryOp
     },
     async verify(txnId, hasher) {
       return connection.withTenant(tenantId, async (tx) => {
-        return await verifyRecord(tx, tenantId, txnId, hasher)
+        return await verifyRecord(tx, tenantId, txnId, hasher, crypto)
       })
     },
   }
+}
+
+async function decryptTransitions(
+  items: readonly TxnTransition[],
+  crypto: PayloadCrypto | undefined,
+): Promise<TxnTransition[]> {
+  if (!crypto) return items as TxnTransition[]
+  const out: TxnTransition[] = []
+  for (const t of items) {
+    const decrypted = await decryptPayload(crypto, t.payload)
+    out.push({ ...t, payload: (decrypted as Record<string, unknown>) ?? {} })
+  }
+  return out
+}
+
+async function decryptAnomalies(
+  items: readonly AnomalyRow[],
+  crypto: PayloadCrypto | undefined,
+): Promise<AnomalyRow[]> {
+  if (!crypto) return items as AnomalyRow[]
+  const out: AnomalyRow[] = []
+  for (const a of items) {
+    out.push({
+      ...a,
+      expected: await decryptPayload(crypto, a.expected),
+      observed: await decryptPayload(crypto, a.observed),
+    })
+  }
+  return out
 }
 
 // =============================================================================
@@ -783,6 +827,7 @@ async function verifyRecord(
   tenantId: string,
   txnId: string,
   hasher: Hasher,
+  crypto: PayloadCrypto | undefined,
 ): Promise<VerifyResult> {
   const transitions = await tx<Record<string, unknown>[]>`
     select * from "txn_transitions"
@@ -807,6 +852,10 @@ async function verifyRecord(
     const storedPrevBuf = storedPrev ? Buffer.from(storedPrev) : null
     const prevMismatch = !buffersEqual(storedPrevBuf, expectedPrev)
 
+    // Hashing is over the PLAINTEXT canonical form. Storage may hold an
+    // `{ "$encrypted": ... }` envelope; decrypt before rehashing so a
+    // payload-crypto rotation never invalidates historical hashes.
+    const decryptedPayload = await decryptPayload(crypto, t['payload'])
     const content: CanonicalValue = {
       id,
       txn_id: t['txn_id'] as string,
@@ -818,7 +867,7 @@ async function verifyRecord(
       schema_version: t['schema_version'] as number,
       actor_type: t['actor_type'] as string,
       actor_id: t['actor_id'] as string,
-      payload: ((t['payload'] as CanonicalValue) ?? {}) as CanonicalValue,
+      payload: ((decryptedPayload as CanonicalValue) ?? {}) as CanonicalValue,
       idempotency_key: t['idempotency_key'] as string,
       occurred_at: t['occurred_at'] as Date,
       reverses: (t['reverses'] as string | null) ?? null,

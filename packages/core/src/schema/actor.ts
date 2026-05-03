@@ -44,12 +44,24 @@ export function defineActor<
   const specs = (input.accounts ?? {}) as Readonly<Record<string, AccountOptions>>
   for (const accountName of Object.keys(specs)) {
     const opts = specs[accountName] as AccountOptions
+    const shards = opts.shards ?? 1
+    const allowOverdraft = opts.allowOverdraft ?? true
+    if (!allowOverdraft && shards > 1) {
+      // Cross-shard balance check would race with concurrent
+      // single-shard writes — the constraint is unenforceable. Refuse
+      // the combination so an operator never thinks they have an
+      // overdraft guard when they don't.
+      throw new Error(
+        `${name}.${accountName}: allowOverdraft: false cannot combine with shards > 1. Pick one.`,
+      )
+    }
     accounts[accountName] = {
       _kind: 'account',
       actorName: name,
       name: accountName,
       currency: opts.currency,
-      shards: opts.shards ?? 1,
+      shards,
+      allowOverdraft,
       ...(opts.parent !== undefined ? { parent: opts.parent } : {}),
     }
   }

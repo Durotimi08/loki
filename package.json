@@ -16,6 +16,7 @@
     "test:integration": "LOKI_INTEGRATION=1 vitest run",
     "test:all": "LOKI_INTEGRATION=1 vitest run",
     "test:types": "vitest --typecheck.only run",
+    "bench": "pnpm --filter @loki/bench bench",
     "typecheck": "pnpm -r --filter \"./packages/*\" typecheck",
     "format": "biome format --write .",
     "format:check": "biome format .",

@@ -1,5 +1,11 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { type AnomalyEvent, type Engine, MIGRATIONS_TABLE, createEngine } from '../../src/index.js'
+import {
+  type AnomalyEvent,
+  type Engine,
+  MIGRATIONS_TABLE,
+  RECONCILER_STATE_TABLE,
+  createEngine,
+} from '../../src/index.js'
 import { chidoriSchema } from '../fixtures.js'
 import { ensurePostgres, teardownPostgres } from './setup.js'
 
@@ -26,6 +32,7 @@ beforeEach(async () => {
       /* fine */
     }
     await engine.connection.sql.unsafe(`drop table if exists ${MIGRATIONS_TABLE}`)
+    await engine.connection.sql.unsafe(`drop table if exists ${RECONCILER_STATE_TABLE}`)
     await engine.close()
   }
   engine = createEngine({ schema: chidoriSchema, connection: { url: dbUrl } })

@@ -4,6 +4,22 @@ exports[`planInitialMigration — Chidori fixture > toDownSql matches the golden
 "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM "ledger_app";
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM "ledger_admin";
 
+DROP POLICY IF EXISTS "txn_disputes_tenant_isolation" ON "txn_disputes";
+
+ALTER TABLE "txn_disputes" DISABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "txn_holds_tenant_isolation" ON "txn_holds";
+
+ALTER TABLE "txn_holds" DISABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "fx_rates_tenant_isolation" ON "fx_rates";
+
+ALTER TABLE "fx_rates" DISABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "txn_scheduled_tenant_isolation" ON "txn_scheduled";
+
+ALTER TABLE "txn_scheduled" DISABLE ROW LEVEL SECURITY;
+
 DROP POLICY IF EXISTS "txn_anomalies_tenant_isolation" ON "txn_anomalies";
 
 ALTER TABLE "txn_anomalies" DISABLE ROW LEVEL SECURITY;
@@ -32,6 +48,10 @@ DROP POLICY IF EXISTS "accounts_tenant_isolation" ON "accounts";
 
 ALTER TABLE "accounts" DISABLE ROW LEVEL SECURITY;
 
+DROP INDEX IF EXISTS "txn_transitions_init_idem_idx";
+
+DROP INDEX IF EXISTS "txn_scheduled_due_idx";
+
 DROP INDEX IF EXISTS "txn_anomalies_severity_idx";
 
 DROP INDEX IF EXISTS "outbox_drain_idx";
@@ -49,6 +69,14 @@ DROP INDEX IF EXISTS "txn_transitions_trace_idx";
 DROP INDEX IF EXISTS "txn_records_creator_idx";
 
 DROP INDEX IF EXISTS "txn_records_type_state_idx";
+
+DROP TABLE IF EXISTS "txn_disputes";
+
+DROP TABLE IF EXISTS "txn_holds";
+
+DROP TABLE IF EXISTS "fx_rates";
+
+DROP TABLE IF EXISTS "txn_scheduled";
 
 DROP TABLE IF EXISTS "txn_anomalies";
 
@@ -213,6 +241,70 @@ CREATE TABLE "txn_anomalies" (
   "resolution"      text
 );
 
+CREATE TABLE "txn_scheduled" (
+  "id"                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  "tenant_id"             text NOT NULL REFERENCES "tenants"("id") ON DELETE RESTRICT,
+  "txn_id"                uuid NOT NULL REFERENCES "txn_records"("id") ON DELETE RESTRICT,
+  "name"                  text NOT NULL,
+  "run_at"                timestamptz NOT NULL,
+  "actor_type"            text NOT NULL,
+  "actor_id"              text NOT NULL,
+  "payload"               jsonb NOT NULL DEFAULT '{}'::jsonb,
+  "with_key"              uuid REFERENCES "txn_keys"("id") ON DELETE RESTRICT,
+  "idempotency_key"       text NOT NULL,
+  "status"                text NOT NULL CHECK ("status" IN ('pending', 'completed', 'cancelled', 'failed')),
+  "attempts"              int NOT NULL DEFAULT 0,
+  "last_error"            text,
+  "fired_at"              timestamptz,
+  "fired_transition_id"   text REFERENCES "txn_transitions"("id") ON DELETE RESTRICT,
+  "created_at"            timestamptz NOT NULL DEFAULT now(),
+  CHECK ("name" IN ('pay', 'cancel', 'refund')),
+  UNIQUE ("tenant_id", "txn_id", "idempotency_key")
+);
+
+CREATE TABLE "fx_rates" (
+  "id"              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  "tenant_id"       text NOT NULL REFERENCES "tenants"("id") ON DELETE RESTRICT,
+  "base_currency"   text NOT NULL,
+  "quote_currency"  text NOT NULL,
+  "rate"            numeric(38, 18) NOT NULL CHECK ("rate" > 0),
+  "fixed_at"        timestamptz NOT NULL,
+  "expires_at"      timestamptz,
+  "source"          text NOT NULL,
+  "created_at"      timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX "fx_rates_lookup_idx" ON "fx_rates"
+  ("tenant_id", "base_currency", "quote_currency", "fixed_at" DESC);
+
+CREATE TABLE "txn_holds" (
+  "id"                          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  "tenant_id"                   text NOT NULL REFERENCES "tenants"("id") ON DELETE RESTRICT,
+  "txn_id"                      uuid REFERENCES "txn_records"("id") ON DELETE RESTRICT,
+  "hold_account_id"             uuid NOT NULL REFERENCES "accounts"("id") ON DELETE RESTRICT,
+  "amount"                      numeric(38, 0) NOT NULL CHECK ("amount" > 0),
+  "status"                      text NOT NULL CHECK ("status" IN ('placed', 'released', 'expired', 'captured')),
+  "expires_at"                  timestamptz,
+  "released_by_transition_id"   text REFERENCES "txn_transitions"("id") ON DELETE RESTRICT,
+  "placed_at"                   timestamptz NOT NULL DEFAULT now(),
+  "released_at"                 timestamptz
+);
+CREATE INDEX "txn_holds_tenant_status_idx" ON "txn_holds"
+  ("tenant_id", "status", "expires_at");
+
+CREATE TABLE "txn_disputes" (
+  "id"                       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  "tenant_id"                text NOT NULL REFERENCES "tenants"("id") ON DELETE RESTRICT,
+  "original_transition_id"   text NOT NULL REFERENCES "txn_transitions"("id") ON DELETE RESTRICT,
+  "status"                   text NOT NULL CHECK ("status" IN ('open', 'resolved_customer', 'resolved_merchant', 'expired')),
+  "opened_at"                timestamptz NOT NULL DEFAULT now(),
+  "deadline_at"              timestamptz,
+  "resolved_at"              timestamptz,
+  "resolution"               text,
+  "reason"                   text
+);
+CREATE INDEX "txn_disputes_tenant_status_idx" ON "txn_disputes"
+  ("tenant_id", "status", "deadline_at");
+
 CREATE INDEX "txn_records_type_state_idx"
   ON "txn_records" (
     "tenant_id",
@@ -282,6 +374,18 @@ CREATE INDEX "txn_anomalies_severity_idx"
     "detected_at" DESC
   );
 
+CREATE INDEX "txn_scheduled_due_idx"
+  ON "txn_scheduled" (
+    "tenant_id",
+    "run_at",
+    "id"
+  )
+  WHERE "status" = 'pending';
+
+CREATE UNIQUE INDEX "txn_transitions_init_idem_idx"
+  ON "txn_transitions" ("tenant_id", "idempotency_key")
+  WHERE "name" = '_init';
+
 ALTER TABLE "accounts" ENABLE ROW LEVEL SECURITY;
 
 ALTER TABLE "accounts" FORCE ROW LEVEL SECURITY;
@@ -338,6 +442,38 @@ CREATE POLICY "txn_anomalies_tenant_isolation" ON "txn_anomalies"
   USING ("tenant_id" = current_setting('loki.tenant_id', true))
   WITH CHECK ("tenant_id" = current_setting('loki.tenant_id', true));
 
+ALTER TABLE "txn_scheduled" ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE "txn_scheduled" FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY "txn_scheduled_tenant_isolation" ON "txn_scheduled"
+  USING ("tenant_id" = current_setting('loki.tenant_id', true))
+  WITH CHECK ("tenant_id" = current_setting('loki.tenant_id', true));
+
+ALTER TABLE "fx_rates" ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE "fx_rates" FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY "fx_rates_tenant_isolation" ON "fx_rates"
+  USING ("tenant_id" = current_setting('loki.tenant_id', true))
+  WITH CHECK ("tenant_id" = current_setting('loki.tenant_id', true));
+
+ALTER TABLE "txn_holds" ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE "txn_holds" FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY "txn_holds_tenant_isolation" ON "txn_holds"
+  USING ("tenant_id" = current_setting('loki.tenant_id', true))
+  WITH CHECK ("tenant_id" = current_setting('loki.tenant_id', true));
+
+ALTER TABLE "txn_disputes" ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE "txn_disputes" FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY "txn_disputes_tenant_isolation" ON "txn_disputes"
+  USING ("tenant_id" = current_setting('loki.tenant_id', true))
+  WITH CHECK ("tenant_id" = current_setting('loki.tenant_id', true));
+
 GRANT SELECT, INSERT, UPDATE, DELETE ON
   "tenants",
   "accounts",
@@ -346,7 +482,11 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
   "txn_keys",
   "postings",
   "outbox",
-  "txn_anomalies"
+  "txn_anomalies",
+  "txn_scheduled",
+  "fx_rates",
+  "txn_holds",
+  "txn_disputes"
 TO "ledger_admin";
 
 GRANT SELECT ON
@@ -357,7 +497,11 @@ GRANT SELECT ON
   "txn_keys",
   "postings",
   "outbox",
-  "txn_anomalies"
+  "txn_anomalies",
+  "txn_scheduled",
+  "fx_rates",
+  "txn_holds",
+  "txn_disputes"
 TO "ledger_app";
 
 GRANT INSERT ON "txn_transitions" TO "ledger_app";
@@ -374,6 +518,20 @@ GRANT INSERT ON "txn_records" TO "ledger_app";
 
 GRANT INSERT ON "txn_keys" TO "ledger_app";
 
+GRANT INSERT ON "txn_scheduled" TO "ledger_app";
+
+GRANT INSERT ON "fx_rates" TO "ledger_app";
+
+GRANT INSERT ON "txn_holds" TO "ledger_app";
+
+GRANT INSERT ON "txn_disputes" TO "ledger_app";
+
+GRANT UPDATE ("status", "released_by_transition_id", "released_at")
+ON "txn_holds" TO "ledger_app";
+
+GRANT UPDATE ("status", "resolved_at", "resolution")
+ON "txn_disputes" TO "ledger_app";
+
 GRANT UPDATE ("state", "version", "active_keys", "compromised", "updated_at")
 ON "txn_records" TO "ledger_app";
 
@@ -387,6 +545,9 @@ ON "outbox" TO "ledger_app";
 
 GRANT UPDATE ("resolved_at", "resolved_by", "resolution")
 ON "txn_anomalies" TO "ledger_app";
+
+GRANT UPDATE ("status", "attempts", "last_error", "fired_at", "fired_transition_id")
+ON "txn_scheduled" TO "ledger_app";
 
 "
 `;

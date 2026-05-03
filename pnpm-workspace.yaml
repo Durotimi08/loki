@@ -1,2 +1,5 @@
 packages:
   - 'packages/*'
+  # Examples are workspace-linked so `@loki/core` resolves locally.
+  # They're `private: true`, so `release` won't publish them.
+  - 'examples/*'

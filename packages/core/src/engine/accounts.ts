@@ -108,6 +108,8 @@ export type AccountDecl = {
   readonly currency: string
   readonly shards: number
   readonly parent?: string
+  /** M1: per-account overdraft policy. Defaults `true` for back-compat. */
+  readonly allowOverdraft: boolean
 }
 
 export function lookupAccountDecl(
@@ -120,12 +122,17 @@ export function lookupAccountDecl(
     throw new LokiError(`Schema has no actor of type "${actorType}".`)
   }
   const account = (
-    actor.accounts as Record<string, { currency: string; shards: number; parent?: string }>
+    actor.accounts as Record<
+      string,
+      { currency: string; shards: number; parent?: string; allowOverdraft?: boolean }
+    >
   )[accountName]
   if (!account) {
     throw new LokiError(`Actor "${actorType}" has no account named "${accountName}".`)
   }
-  return account
+  // `allowOverdraft` defaults true for any schema authored before M1
+  // shipped. New schemas that opt in flip it to false on creation.
+  return { ...account, allowOverdraft: account.allowOverdraft ?? true }
 }
 
 export async function provisionShards(

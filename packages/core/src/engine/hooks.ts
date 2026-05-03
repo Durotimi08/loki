@@ -22,6 +22,8 @@ export type AnomalyCheckName =
   | 'checksum_mismatch'
   | 'state_mismatch'
   | 'fabricated_key'
+  /** M16, Batch D — pinned rate on a transition no longer matches the FX table within tolerance. */
+  | 'fx_rate_drift'
 
 export type AnomalySeverity = 'warn' | 'error' | 'critical'
 
@@ -48,6 +50,14 @@ export type BeforeTransitionEvent = {
   readonly data: Record<string, unknown>
   readonly idempotencyKey: string
   readonly traceId?: string
+  /**
+   * Aborted when the configured `beforeTransitionTimeoutMs` expires.
+   * Cooperative handlers (`fetch(..., { signal })`, `AbortSignal`-aware
+   * libs) get true cancellation. Synchronous CPU-bound code obviously
+   * keeps running until it yields — the engine's race on the same
+   * timer ensures the transition tx aborts regardless. M4.
+   */
+  readonly signal?: AbortSignal
 }
 
 export type AfterTransitionEvent = {
@@ -252,7 +262,37 @@ export type HookInternals = {
   readonly counts: () => Readonly<Record<string, number>>
 }
 
-export function createHookRegistry(): HookRegistry {
+export type HookRegistryOptions = {
+  /**
+   * Timeout in ms for `beforeTransition` handlers. The handler runs
+   * inside the transition's DB tx; a runaway handler would hold row
+   * locks and starve other writers. When exceeded, the engine throws
+   * `BeforeTransitionTimeoutError` which aborts the tx normally.
+   *
+   * Default: `1000` (one second). Pass `null` to disable.
+   */
+  readonly beforeTransitionTimeoutMs?: number | null
+}
+
+/**
+ * Thrown when a `beforeTransition` handler exceeds
+ * `HookRegistryOptions.beforeTransitionTimeoutMs`. Aborts the in-flight
+ * transition tx — the same path as a hook that throws explicitly.
+ */
+export class BeforeTransitionTimeoutError extends Error {
+  readonly timeoutMs: number
+  constructor(timeoutMs: number) {
+    super(
+      `beforeTransition hook exceeded ${timeoutMs}ms timeout. The handler runs inside the transition tx; move long work to afterTransition or an outbox handler.`,
+    )
+    this.name = 'BeforeTransitionTimeoutError'
+    this.timeoutMs = timeoutMs
+  }
+}
+
+export function createHookRegistry(options: HookRegistryOptions = {}): HookRegistry {
+  const beforeTimeoutMs =
+    options.beforeTransitionTimeoutMs === undefined ? 1_000 : options.beforeTransitionTimeoutMs
   let nextId = 1
 
   const before: Registration<BeforeTransitionEvent>[] = []
@@ -360,9 +400,34 @@ export function createHookRegistry(): HookRegistry {
         // Sequential — order matters and a throw aborts. Errors are
         // NOT routed to onHookFailure because they're load-bearing
         // (the abort signal).
+        //
+        // Each handler races against `beforeTransitionTimeoutMs`. The
+        // handler runs inside the transition's DB tx, so a runaway
+        // would hold row locks; throwing aborts the tx normally. M4:
+        // we also pass an `AbortSignal` so cooperative handlers (fetch,
+        // AbortSignal-aware libs) cancel real work, not just the await.
         for (const reg of before) {
-          if (await matches(event, reg.filter)) {
+          if (!(await matches(event, reg.filter))) continue
+          if (beforeTimeoutMs === null || beforeTimeoutMs <= 0) {
             await reg.handler(event)
+            continue
+          }
+          const ac = new AbortController()
+          let timer: ReturnType<typeof setTimeout> | null = null
+          const timeout = new Promise<never>((_, rej) => {
+            timer = setTimeout(() => {
+              ac.abort()
+              rej(new BeforeTransitionTimeoutError(beforeTimeoutMs))
+            }, beforeTimeoutMs)
+          })
+          try {
+            const eventWithSignal: BeforeTransitionEvent = {
+              ...event,
+              signal: ac.signal,
+            }
+            await Promise.race([Promise.resolve(reg.handler(eventWithSignal)), timeout])
+          } finally {
+            if (timer) clearTimeout(timer)
           }
         }
       },

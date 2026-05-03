@@ -1,7 +1,19 @@
 import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import type { ConnectionInput, MigrationOptions, SchemaDef } from '@loki/core'
+import type { ConnectionInput, MigrationOptions, SchemaDef, TxnTransition } from '@loki/core'
+
+/**
+ * Restrictive-change enforcer (§14.2). Used by `loki migrate enforce
+ * <name>` to surface records whose stored transitions violate a
+ * newly-introduced invariant.
+ */
+export type LokiEnforcer = {
+  readonly txnType: string
+  readonly transitionName?: string
+  readonly predicate: (transition: TxnTransition) => boolean
+  readonly description?: string
+}
 
 /**
  * The shape every Loki config module must export as `default`. JS/MJS
@@ -12,6 +24,8 @@ export type LokiConfig = {
   readonly schema: SchemaDef
   readonly connection: ConnectionInput
   readonly migration?: MigrationOptions
+  /** Named enforcers consumed by `loki migrate enforce <name>`. */
+  readonly enforcers?: Readonly<Record<string, LokiEnforcer>>
 }
 
 const DEFAULT_PATHS = ['loki.config.js', 'loki.config.mjs', 'loki.config.ts']

@@ -196,4 +196,84 @@ describe('outbox — retry + terminal failure', () => {
     })
     expect(second).toBe(0)
   })
+
+  it('claim TTL prevents double-delivery on a simulated worker crash (C2)', async () => {
+    if (!engine) return
+    await enqueuePayment(engine, 'crash')
+
+    // Worker A claims and starts dispatching but never returns
+    // (simulating a process death after PSP call but before phase-3
+    // commit). We just call drainOnce with a hanging handler that we
+    // never resolve — instead, we kick off the call without awaiting,
+    // then immediately try to drain from "worker B".
+    let resolveHang: (() => void) | undefined
+    const hung = new Promise<void>((res) => {
+      resolveHang = res
+    })
+    const dispatcher = async () => {
+      await hung
+    }
+
+    // Worker A: claim + dispatch (blocks). Don't await.
+    const aPromise = engine.outbox.drainOnce({
+      handler: dispatcher,
+      claimTtlMs: 60_000, // 60s lease — peer must NOT poach inside this window
+    })
+
+    // Give postgres.js a tick to actually claim the row.
+    await new Promise((res) => setTimeout(res, 100))
+
+    // Worker B: try to claim. Should see zero because A's lease is in force.
+    const bSeen = await engine.outbox.drainOnce({
+      handler: async () => {
+        /* never called */
+      },
+      claimTtlMs: 60_000,
+    })
+    expect(bSeen).toBe(0)
+
+    // Let A finish (simulate eventual recovery).
+    if (resolveHang) resolveHang()
+    await aPromise
+  })
+
+  it('expired claim leases are re-claimable by peers', async () => {
+    if (!engine) return
+    await enqueuePayment(engine, 'expired')
+
+    // Phase 1 with a tiny TTL.
+    let firstHandlerCalls = 0
+    let firstResolved: (() => void) | undefined
+    const firstHung = new Promise<void>((res) => {
+      firstResolved = res
+    })
+    const firstDispatcher = async () => {
+      firstHandlerCalls++
+      await firstHung
+    }
+    const aPromise = engine.outbox.drainOnce({
+      handler: firstDispatcher,
+      claimTtlMs: 50, // expires almost immediately
+    })
+
+    // Wait past the TTL.
+    await new Promise((res) => setTimeout(res, 150))
+
+    // Worker B should now be able to re-claim.
+    let bHandlerCalls = 0
+    const bSeen = await engine.outbox.drainOnce({
+      handler: async () => {
+        bHandlerCalls++
+      },
+      claimTtlMs: 60_000,
+    })
+    expect(bSeen).toBe(1)
+    expect(bHandlerCalls).toBe(1)
+
+    // A is still hanging; let it finish (it would mark delivered_at,
+    // but it's racing the cleanup so we don't assert exact state).
+    if (firstResolved) firstResolved()
+    await aPromise
+    expect(firstHandlerCalls).toBe(1)
+  })
 })

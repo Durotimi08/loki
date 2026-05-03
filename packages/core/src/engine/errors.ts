@@ -50,16 +50,25 @@ export class KeyAlreadyConsumedError extends LokiError {
   }
 }
 
-/** Postings on a transition do not balance (sum debits ≠ sum credits). */
+/**
+ * Postings on a transition do not balance (sum debits ≠ sum credits).
+ *
+ * Multi-currency: balance is enforced per currency. `currency === null`
+ * is the legacy single-currency form; `currency` populated identifies
+ * the offending leg of an FX transition.
+ */
 export class UnbalancedPostingsError extends LokiError {
   readonly debits: bigint
   readonly credits: bigint
+  readonly currency: string | null
 
-  constructor(debits: bigint, credits: bigint) {
-    super(`Transition postings do not balance: sum(D) = ${debits}, sum(C) = ${credits}.`)
+  constructor(debits: bigint, credits: bigint, currency: string | null = null) {
+    const suffix = currency ? ` for currency ${currency}` : ''
+    super(`Transition postings do not balance${suffix}: sum(D) = ${debits}, sum(C) = ${credits}.`)
     this.name = 'UnbalancedPostingsError'
     this.debits = debits
     this.credits = credits
+    this.currency = currency
   }
 }
 
@@ -95,6 +104,52 @@ export class ConcurrencyConflictError extends LokiError {
   constructor(recordId: string, attempts: number) {
     super(`Concurrency conflict on record ${recordId} after ${attempts} retries.`)
     this.name = 'ConcurrencyConflictError'
+  }
+}
+
+/**
+ * A posting draft was rejected before reaching the balanced check —
+ * negative amount, missing account ref, or zero postings on a
+ * transition that declared a `postings` clause. Distinct from
+ * `UnbalancedPostingsError` so callers can tell "your numbers don't
+ * add up" apart from "your inputs are malformed".
+ */
+export class InvalidPostingError extends LokiError {
+  readonly reason: string
+  constructor(reason: string, detail?: Record<string, unknown>) {
+    const tail = detail ? ` ${JSON.stringify(detail)}` : ''
+    super(`Invalid posting: ${reason}.${tail}`)
+    this.name = 'InvalidPostingError'
+    this.reason = reason
+  }
+}
+
+/**
+ * Thrown when a transition would take an account with
+ * `allowOverdraft: false` below zero. The transition tx is rolled
+ * back; nothing is written. M1.
+ */
+export class OverdraftError extends LokiError {
+  readonly accountId: string
+  readonly currentBalance: bigint
+  readonly attemptedDelta: bigint
+  constructor(opts: {
+    accountId: string
+    accountName: string
+    actorType: string
+    actorId: string
+    currency: string
+    currentBalance: bigint
+    attemptedDelta: bigint
+  }) {
+    const next = opts.currentBalance + opts.attemptedDelta
+    super(
+      `Overdraft refused on ${opts.actorType}:${opts.actorId}.${opts.accountName} (${opts.currency}): balance ${opts.currentBalance} + delta ${opts.attemptedDelta} = ${next} < 0.`,
+    )
+    this.name = 'OverdraftError'
+    this.accountId = opts.accountId
+    this.currentBalance = opts.currentBalance
+    this.attemptedDelta = opts.attemptedDelta
   }
 }
 

@@ -1,7 +1,16 @@
-import type { ActorDef, AliasMap, SchemaDef, TenantDef, TransactionDef } from './types.js'
+import type {
+  ActorDef,
+  AliasMap,
+  ProjectionDef,
+  SchemaDef,
+  TenantDef,
+  TransactionDef,
+} from './types.js'
 import { validateSchema } from './validate.js'
 export { diffSchemas } from './diff.js'
 export type { ChangeKind, SchemaChange, SchemaDiff } from './diff.js'
+export { defineProjection } from './projection.js'
+export type { ProjectionInput } from './projection.js'
 
 export type SchemaInputArgs<
   TTenant extends TenantDef,
@@ -23,6 +32,13 @@ export type SchemaInputArgs<
    * semantics while new code reads with the new names.
    */
   readonly aliases?: Readonly<Record<number, AliasMap>>
+  /**
+   * Materialized projections (§12.9). Each entry is built via
+   * `defineProjection(name, ...)`; the engine creates a `proj_<name>`
+   * table at migration time and maintains it synchronously inside the
+   * transition tx.
+   */
+  readonly projections?: readonly ProjectionDef[]
   /**
    * Skip validation. Tests use this to assert that broken schemas are
    * detected at validation time without throwing during construction.
@@ -63,6 +79,7 @@ export function defineSchema<
     transactions: input.transactions,
     version: input.version ?? 1,
     aliases: input.aliases ?? {},
+    projections: input.projections ?? [],
     meta: {
       actorsByName,
       transactionsByName,

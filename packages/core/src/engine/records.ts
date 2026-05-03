@@ -1,3 +1,4 @@
+import { type PayloadCrypto, decryptPayload, encryptPayload } from '../primitives/payload-crypto.js'
 import { ulid } from '../primitives/ulid.js'
 import type { ActorDef, SchemaDef, TransactionDef } from '../schema/types.js'
 import type { AccountInstanceRef, PostingDraft } from '../schema/types.js'
@@ -9,14 +10,17 @@ import {
   CompromisedRecordError,
   ConcurrencyConflictError,
   IllegalStateTransitionError,
+  InvalidPostingError,
   KeyAlreadyConsumedError,
   LokiError,
+  OverdraftError,
   RejectTransition,
   UnbalancedPostingsError,
   UnknownTransitionError,
 } from './errors.js'
 import { type Hasher, computePostingsChecksum, computeRowHash } from './hash.js'
 import type { HookRegistry } from './hooks.js'
+import { type EngineInstruments, buildInstruments } from './observability.js'
 import type {
   AccountIdentity,
   ActorRef,
@@ -76,6 +80,27 @@ export type RecordOpsContext = {
   readonly connection: Connection
   readonly hasher: Hasher
   readonly hooks: HookRegistry
+  /**
+   * Override how the engine picks a shard when posting to a sharded
+   * account (M7). Returns an integer in `[0, n)`. Default: `Math.random`
+   * — fine for distribution, deterministic in tests if you swap in a
+   * seeded variant or `() => 0`. Must NOT depend on `tenantId` or
+   * `accountId` to avoid hot-account contention; the whole point of
+   * sharding is to spread writers across N rows.
+   */
+  readonly shardPicker?: (n: number) => number
+  /** Wall-clock for test injection. Default `() => new Date()`. */
+  readonly clock?: () => Date
+  /**
+   * Optional payload encryption hook (M6). When set, every value
+   * written into `txn_transitions.payload` and `outbox.payload` is
+   * wrapped in an `{ "$encrypted": ... }` envelope. The hash chain is
+   * still computed over the PLAINTEXT canonical form so a key rotation
+   * never invalidates `row_hash`. On read, the engine auto-decrypts.
+   */
+  readonly payloadCrypto?: PayloadCrypto
+  /** Observability instruments (Batch H). Defaults to no-op shims. */
+  readonly instruments?: EngineInstruments
 }
 
 const GENESIS_NAME = '_init'
@@ -87,6 +112,8 @@ function isUuid(value: string): boolean {
 
 export function buildRecordOps(ctx: RecordOpsContext): RecordOps {
   const { schema, tenantId, connection, hasher, hooks } = ctx
+  const clock = ctx.clock ?? (() => new Date())
+  const crypto = ctx.payloadCrypto
 
   return {
     async create(input) {
@@ -115,49 +142,87 @@ export function buildRecordOps(ctx: RecordOpsContext): RecordOps {
           return { record, replayed: true, transitionId: existing.id }
         }
 
-        const recordId = await insertRecord(
-          tx,
-          tenantId,
-          txn,
-          input.by,
-          participants,
-          schema.version,
-        )
+        // Race-safe genesis insert (§6.2). The partial unique index
+        // `(tenant_id, idempotency_key) WHERE name = '_init'` serialises
+        // concurrent create() calls. We wrap BOTH the record insert
+        // and the transition insert in one savepoint so the loser's
+        // orphan record rolls back along with the failed transition.
         const transitionId = ulid()
-        const occurredAt = new Date()
+        const occurredAt = clock()
+        let recordId: string | null = null
+        let raceConflict = false
+        try {
+          await tx.savepoint(async (sp) => {
+            recordId = await insertRecord(sp, tenantId, txn, input.by, participants, schema.version)
+            const content: CanonicalValue = {
+              id: transitionId,
+              txn_id: recordId,
+              tenant_id: tenantId,
+              type: txn.name,
+              from_state: null,
+              to_state: txn.initial,
+              name: GENESIS_NAME,
+              schema_version: schema.version,
+              actor_type: input.by.type,
+              actor_id: input.by.id,
+              payload: {},
+              idempotency_key: input.idempotencyKey,
+              occurred_at: occurredAt,
+              reverses: null,
+            }
+            const rowHash = computeRowHash(hasher, content, null)
+            const postingsChecksum = computePostingsChecksum(hasher, [])
+            const storagePayload = crypto ? await encryptPayload(crypto, {}) : {}
+            await sp`
+              insert into "txn_transitions" (
+                id, tenant_id, txn_id, type, from_state, to_state, name,
+                schema_version, actor_type, actor_id, payload,
+                idempotency_key, trace_id, prev_hash, row_hash,
+                postings_checksum, reverses, occurred_at
+              ) values (
+                ${transitionId}, ${tenantId}, ${recordId}, ${txn.name}, ${null},
+                ${txn.initial}, ${GENESIS_NAME}, ${schema.version}, ${input.by.type}, ${input.by.id},
+                ${sp.json(storagePayload as never)}, ${input.idempotencyKey}, ${input.traceId ?? null},
+                ${null}, ${rowHash}, ${postingsChecksum}, ${null}, ${occurredAt}
+              )
+            `
+          })
+        } catch (e) {
+          if (!isPgUniqueViolation(e)) throw e
+          raceConflict = true
+        }
+        if (raceConflict) {
+          const winner = await findExistingTransition(tx, tenantId, input.idempotencyKey)
+          if (!winner) {
+            throw new LokiError(
+              `Idempotency key "${input.idempotencyKey}" hit a unique violation but no existing row was found.`,
+            )
+          }
+          const winnerRecord = await loadRecord(tx, tenantId, winner.txn_id)
+          if (!winnerRecord) {
+            throw new LokiError(
+              `Idempotent replay found genesis transition ${winner.id} but record ${winner.txn_id} is missing.`,
+            )
+          }
+          return { record: winnerRecord, replayed: true, transitionId: winner.id }
+        }
+        if (recordId === null) {
+          throw new LokiError('Record id was not assigned during create().')
+        }
 
-        const content: CanonicalValue = {
+        await writeProjections(tx, schema, {
           id: transitionId,
-          txn_id: recordId,
           tenant_id: tenantId,
+          txn_id: recordId,
           type: txn.name,
+          name: GENESIS_NAME,
           from_state: null,
           to_state: txn.initial,
-          name: GENESIS_NAME,
-          schema_version: schema.version,
           actor_type: input.by.type,
           actor_id: input.by.id,
-          payload: {},
-          idempotency_key: input.idempotencyKey,
+          schema_version: schema.version,
           occurred_at: occurredAt,
-          reverses: null,
-        }
-        const rowHash = computeRowHash(hasher, content, null)
-        const postingsChecksum = computePostingsChecksum(hasher, [])
-
-        await tx`
-          insert into "txn_transitions" (
-            id, tenant_id, txn_id, type, from_state, to_state, name,
-            schema_version, actor_type, actor_id, payload,
-            idempotency_key, trace_id, prev_hash, row_hash,
-            postings_checksum, reverses, occurred_at
-          ) values (
-            ${transitionId}, ${tenantId}, ${recordId}, ${txn.name}, ${null},
-            ${txn.initial}, ${GENESIS_NAME}, ${schema.version}, ${input.by.type}, ${input.by.id},
-            ${tx.json({})}, ${input.idempotencyKey}, ${input.traceId ?? null},
-            ${null}, ${rowHash}, ${postingsChecksum}, ${null}, ${occurredAt}
-          )
-        `
+        })
 
         const record = await loadRecord(tx, tenantId, recordId)
         if (!record) throw new LokiError('Record vanished mid-transaction.')
@@ -224,7 +289,14 @@ export function buildRecordOps(ctx: RecordOpsContext): RecordOps {
           where tenant_id = ${tenantId} and txn_id = ${id}
           order by id asc
         `
-        return rows.map(mapTransition)
+        const mapped = rows.map(mapTransition)
+        if (!crypto) return mapped
+        const out: TxnTransition[] = []
+        for (const t of mapped) {
+          const decrypted = await decryptPayload(crypto, t.payload)
+          out.push({ ...t, payload: (decrypted as Record<string, unknown>) ?? {} })
+        }
+        return out
       })
     },
   }
@@ -238,13 +310,37 @@ async function runTransition(
   ctx: RecordOpsContext,
   input: TransitionInputArgs,
 ): Promise<TransitionResult> {
+  const instruments = ctx.instruments ?? buildInstruments()
+  const startTime = Date.now()
+  try {
+    const result = await runTransitionInner(ctx, input)
+    instruments.transitionDurationMs.observe(Date.now() - startTime, {
+      type: input.id ? 'transition' : 'unknown',
+      name: input.name,
+    })
+    return result
+  } catch (e) {
+    instruments.transitionErrors.inc(1, {
+      name: input.name,
+      error: e instanceof Error ? e.constructor.name : 'Unknown',
+    })
+    throw e
+  }
+}
+
+async function runTransitionInner(
+  ctx: RecordOpsContext,
+  input: TransitionInputArgs,
+): Promise<TransitionResult> {
   const { schema, tenantId, connection, hasher, hooks } = ctx
+  const crypto = ctx.payloadCrypto
+  const clock = ctx.clock ?? (() => new Date())
 
   const result = await connection.withTenant(tenantId, async (tx) => {
     // ---- 1. Idempotency probe ---------------------------------------------
     const existing = await findExistingTransition(tx, tenantId, input.idempotencyKey)
     if (existing && existing.txn_id === input.id) {
-      return await replayTransition(tx, tenantId, existing.id)
+      return await replayTransition(tx, tenantId, existing.id, crypto)
     }
     if (existing) {
       throw new LokiError(
@@ -259,6 +355,22 @@ async function runTransition(
     }
     if (record.compromised) {
       throw new CompromisedRecordError(record.id)
+    }
+
+    // ---- 2a. Re-probe after the lock (§6.2 race) --------------------------
+    // We blocked on `lockRecord`; the lock holder may have just inserted a
+    // transition with this exact idempotency key on this record and
+    // committed. Re-checking before state validation lets the loser
+    // converge to the winner's outcome instead of failing the (now
+    // moved-on) state check.
+    const winnerAfterLock = await findExistingTransition(tx, tenantId, input.idempotencyKey)
+    if (winnerAfterLock && winnerAfterLock.txn_id === record.id) {
+      return await replayTransition(tx, tenantId, winnerAfterLock.id, crypto)
+    }
+    if (winnerAfterLock) {
+      throw new LokiError(
+        `Idempotency key "${input.idempotencyKey}" was already used on a different record.`,
+      )
     }
 
     const txnDef = lookupTransaction(schema, record.type)
@@ -310,7 +422,7 @@ async function runTransition(
 
     // ---- 5. Build participant handles + compute postings ------------------
     const transitionId = ulid()
-    const occurredAt = new Date()
+    const occurredAt = clock()
     const data = input.data ?? {}
     const participantHandles = await buildParticipantHandles(
       tx,
@@ -323,6 +435,7 @@ async function runTransition(
     //   - an `invert:<name>` reference (reversal transitions): load
     //     the original transition's postings and flip every direction
     const postingsResolution = await resolvePostingsForTransition({
+      schema,
       transitionDef,
       tx,
       tenantId,
@@ -332,9 +445,22 @@ async function runTransition(
       occurredAt,
       transitionId,
       ...(input.traceId !== undefined ? { traceId: input.traceId } : {}),
+      ...(ctx.shardPicker !== undefined ? { shardPicker: ctx.shardPicker } : {}),
     })
     const resolvedPostings = postingsResolution.postings
     const reverses = postingsResolution.reversesTransitionId
+
+    // H3: a transition that declares `postings` MUST resolve at least
+    // one. State-only transitions don't declare it; if a function was
+    // supplied and returned `[]`, that's almost always a bug — the
+    // author meant to return debits/credits and forgot. `assertBalanced`
+    // would silently pass `[]`, so we backstop here.
+    if (transitionDef.postings !== undefined && resolvedPostings.length === 0) {
+      throw new InvalidPostingError(
+        'transition declared `postings` but resolved to an empty list',
+        { txnType: record.type, transition: input.name },
+      )
+    }
 
     // ---- 6. Lock affected accounts (deterministic id order) ---------------
     await lockAccountsInOrder(
@@ -410,21 +536,66 @@ async function runTransition(
       })),
     )
 
+    // M6: encrypt the JSON-storage form AFTER the hash has been
+    // computed over plaintext. Storage holds an envelope; the hash
+    // chain still verifies because the reconciler decrypts before
+    // recomputing.
+    const jsonifiedPayload = jsonifyForStorage(data)
+    const storageTransitionPayload = crypto
+      ? await encryptPayload(crypto, jsonifiedPayload)
+      : jsonifiedPayload
+
     // ---- 8. INSERT transition + postings + balance update -----------------
-    await tx`
-      insert into "txn_transitions" (
-        id, tenant_id, txn_id, type, from_state, to_state, name,
-        schema_version, actor_type, actor_id, payload,
-        idempotency_key, trace_id, prev_hash, row_hash,
-        postings_checksum, reverses, occurred_at
-      ) values (
-        ${transitionId}, ${tenantId}, ${record.id}, ${record.type}, ${record.state},
-        ${transitionDef.to}, ${input.name}, ${schema.version},
-        ${input.by.type}, ${input.by.id}, ${tx.json(jsonifyForStorage(data) as never)},
-        ${input.idempotencyKey}, ${input.traceId ?? null},
-        ${prevHash}, ${rowHash}, ${postingsChecksum}, ${reverses}, ${occurredAt}
+    // §6.2 idempotency under races: the probe at step 1 doesn't hold a
+    // lock on `(tenant_id, idempotency_key)`. Two writers that miss
+    // simultaneously will both reach this INSERT; one wins, the other
+    // hits the unique index. Wrap in a savepoint so the loser can
+    // recover and replay the winner's outcome inside the same tx.
+    let raceConflict = false
+    try {
+      await tx.savepoint(async (sp) => {
+        await sp`
+          insert into "txn_transitions" (
+            id, tenant_id, txn_id, type, from_state, to_state, name,
+            schema_version, actor_type, actor_id, payload,
+            idempotency_key, trace_id, prev_hash, row_hash,
+            postings_checksum, reverses, occurred_at
+          ) values (
+            ${transitionId}, ${tenantId}, ${record.id}, ${record.type}, ${record.state},
+            ${transitionDef.to}, ${input.name}, ${schema.version},
+            ${input.by.type}, ${input.by.id}, ${sp.json(storageTransitionPayload as never)},
+            ${input.idempotencyKey}, ${input.traceId ?? null},
+            ${prevHash}, ${rowHash}, ${postingsChecksum}, ${reverses}, ${occurredAt}
+          )
+        `
+      })
+    } catch (e) {
+      if (!isPgUniqueViolation(e)) throw e
+      raceConflict = true
+    }
+    if (raceConflict) {
+      const winner = await findExistingTransition(tx, tenantId, input.idempotencyKey)
+      if (winner && winner.txn_id === record.id) {
+        return await replayTransition(tx, tenantId, winner.id, crypto)
+      }
+      throw new LokiError(
+        `Idempotency key "${input.idempotencyKey}" was already used on a different record.`,
       )
-    `
+    }
+
+    await writeProjections(tx, schema, {
+      id: transitionId,
+      tenant_id: tenantId,
+      txn_id: record.id,
+      type: record.type,
+      name: input.name,
+      from_state: record.state,
+      to_state: transitionDef.to,
+      actor_type: input.by.type,
+      actor_id: input.by.id,
+      schema_version: schema.version,
+      occurred_at: occurredAt,
+    })
 
     const insertedPostings: Posting[] = []
     for (const p of resolvedPostings) {
@@ -436,18 +607,79 @@ async function runTransition(
       if (row) insertedPostings.push(mapPosting(row))
     }
 
+    // M1 overdraft enforcement. Sum per-account net deltas first so a
+    // transition with both a debit and a credit on the same account
+    // (rare but legal) is checked against the net effect, not each
+    // half. Reversal transitions (`invert:`) bypass — the whole point
+    // of a reversal is to refund, and the reversal author is taking
+    // responsibility for the resulting state.
+    const isReversal = reverses !== null
+    const netByAccount = new Map<string, bigint>()
     for (const p of resolvedPostings) {
-      // Loki accounts represent "what does this actor have right now" —
-      // money INTO the account is a credit, money OUT is a debit. From
-      // a strict double-entry perspective this matches the convention
-      // for liability/equity-side accounts, which is what every
-      // user/driver/company-balance row actually is.
       const delta = p.direction === 'C' ? p.amount : -p.amount
-      await tx`
-        update "accounts"
-        set balance = balance + ${delta.toString()}::numeric
-        where tenant_id = ${tenantId} and id = ${p.accountId}
-      `
+      netByAccount.set(p.accountId, (netByAccount.get(p.accountId) ?? 0n) + delta)
+    }
+    // Posting-level overdraft flag was carried up from `resolveDrafts`
+    // (and rehydrated for reversals via the source row's account def).
+    const overdraftByAccount = new Map<string, boolean>()
+    for (const p of resolvedPostings) {
+      // If multiple postings hit the same account, the policy is the
+      // same (it's a property of the account, not the posting), but
+      // record from the first.
+      if (!overdraftByAccount.has(p.accountId)) {
+        overdraftByAccount.set(p.accountId, p.allowOverdraft)
+      }
+    }
+    for (const [accountId, delta] of netByAccount) {
+      // Loki accounts represent "what does this actor have right now" —
+      // money INTO the account is a credit, money OUT is a debit.
+      const allowOverdraft = overdraftByAccount.get(accountId) ?? true
+      const enforce = !isReversal && !allowOverdraft && delta < 0n
+      if (enforce) {
+        // Guarded update — returns 0 rows when the new balance would
+        // go negative. We then surface the precise violation by
+        // re-reading the current balance.
+        const updated = await tx<{ balance: string }[]>`
+          update "accounts"
+          set balance = balance + ${delta.toString()}::numeric
+          where tenant_id = ${tenantId}
+            and id = ${accountId}
+            and balance + ${delta.toString()}::numeric >= 0
+          returning balance::text as balance
+        `
+        if (updated.length === 0) {
+          const [current] = await tx<
+            {
+              balance: string
+              name: string
+              owner_actor_type: string
+              owner_actor_id: string
+              currency: string
+            }[]
+          >`
+            select balance::text as balance, name, owner_actor_type, owner_actor_id, currency
+            from "accounts" where tenant_id = ${tenantId} and id = ${accountId}
+          `
+          if (!current) {
+            throw new LokiError(`Overdraft check could not find account ${accountId}.`)
+          }
+          throw new OverdraftError({
+            accountId,
+            accountName: current.name,
+            actorType: current.owner_actor_type,
+            actorId: current.owner_actor_id,
+            currency: current.currency,
+            currentBalance: BigInt(current.balance),
+            attemptedDelta: delta,
+          })
+        }
+      } else {
+        await tx`
+          update "accounts"
+          set balance = balance + ${delta.toString()}::numeric
+          where tenant_id = ${tenantId} and id = ${accountId}
+        `
+      }
     }
 
     // ---- 9. Keys: consume `needs`, mint `unlocks` ------------------------
@@ -507,6 +739,15 @@ async function runTransition(
     // carries the adapter-routing directive. Either may be NULL.
     if (transitionDef.emit || transitionDef.intent) {
       const eventName = transitionDef.emit ?? transitionDef.intent ?? null
+      // M6: outbox payloads share the transition's encryption envelope.
+      // The same `jsonifiedPayload` is reused so the two columns hold
+      // byte-identical plaintext (or byte-identical ciphertext under
+      // crypto with a deterministic IV; either way the round-trip is
+      // sound — adapters call `engine.decryptPayload(event.payload)` for
+      // raw rows or use the auto-decrypted form via `OutboxEvent`).
+      const storageOutboxPayload = crypto
+        ? await encryptPayload(crypto, jsonifiedPayload)
+        : jsonifiedPayload
       await tx`
         insert into "outbox" (
           tenant_id, txn_id, transition_id, event, intent, payload
@@ -516,7 +757,7 @@ async function runTransition(
           ${transitionId},
           ${eventName},
           ${transitionDef.intent ?? null},
-          ${tx.json(jsonifyForStorage(data) as never)}
+          ${tx.json(storageOutboxPayload as never)}
         )
       `
     }
@@ -527,9 +768,17 @@ async function runTransition(
     if (!newTransition) {
       throw new LokiError('Inserted transition not retrievable.')
     }
+    const decryptedTransition = crypto
+      ? {
+          ...newTransition,
+          payload:
+            ((await decryptPayload(crypto, newTransition.payload)) as Record<string, unknown>) ??
+            {},
+        }
+      : newTransition
     return {
       record: newRecord,
-      transition: newTransition,
+      transition: decryptedTransition,
       postings: insertedPostings,
       unlocked: unlockedMap,
       replayed: false,
@@ -572,6 +821,7 @@ async function replayTransition(
   tx: SqlTransaction,
   tenantId: string,
   transitionId: string,
+  crypto?: PayloadCrypto,
 ): Promise<TransitionResult> {
   const transition = await loadTransition(tx, tenantId, transitionId)
   if (!transition) {
@@ -592,9 +842,16 @@ async function replayTransition(
   `
   const unlocked: Record<string, string> = {}
   for (const r of unlockedRows) unlocked[r['name'] as string] = r['id'] as string
+  const decrypted = crypto
+    ? {
+        ...transition,
+        payload:
+          ((await decryptPayload(crypto, transition.payload)) as Record<string, unknown>) ?? {},
+      }
+    : transition
   return {
     record,
-    transition,
+    transition: decrypted,
     postings: postingsRows.map(mapPosting),
     unlocked,
     replayed: true,
@@ -664,6 +921,24 @@ async function findExistingTransition(
     limit 1
   `
   return row ?? null
+}
+
+/**
+ * Postgres unique-violation detection. The 23505 SQLSTATE bubbles up
+ * verbatim from postgres.js inside an open tx; outside a tx the
+ * connection wrapper repackages it under `.cause`. Either way we
+ * recognise the unique-violation we raise on `(tenant_id, txn_id,
+ * idempotency_key)` so the engine can reconverge to the winner.
+ */
+function isPgUniqueViolation(e: unknown): boolean {
+  if (e === null || typeof e !== 'object') return false
+  const direct = (e as { code?: unknown }).code
+  if (direct === '23505') return true
+  const cause = (e as { cause?: unknown }).cause
+  if (cause && typeof cause === 'object' && (cause as { code?: unknown }).code === '23505') {
+    return true
+  }
+  return false
 }
 
 async function lockRecord(
@@ -775,6 +1050,10 @@ type ResolvedPosting = {
   readonly accountId: string
   readonly direction: 'D' | 'C'
   readonly amount: bigint
+  /** Account currency. Drives per-currency balance enforcement (M16). */
+  readonly currency: string
+  /** Whether the schema allows the balance on this account to go negative (M1). */
+  readonly allowOverdraft: boolean
 }
 
 type PostingsResolution = {
@@ -788,6 +1067,7 @@ type PostingsResolution = {
 }
 
 type ResolveTransitionPostingsArgs = {
+  readonly schema: SchemaDef
   readonly transitionDef: { postings?: unknown }
   readonly tx: SqlTransaction
   readonly tenantId: string
@@ -797,6 +1077,7 @@ type ResolveTransitionPostingsArgs = {
   readonly occurredAt: Date
   readonly transitionId: string
   readonly traceId?: string
+  readonly shardPicker?: (n: number) => number
 }
 
 /**
@@ -822,7 +1103,7 @@ async function resolvePostingsForTransition(
   }
 
   if (typeof fn === 'string') {
-    return resolveInvertReference(tx, tenantId, record, fn)
+    return resolveInvertReference(tx, args.schema, tenantId, record, fn)
   }
 
   const ctx = {
@@ -834,20 +1115,26 @@ async function resolvePostingsForTransition(
     occurredAt: args.occurredAt,
   }
   const drafts = (fn as (c: typeof ctx) => readonly PostingDraft[])(ctx)
-  const postings = await resolveDrafts(tx, tenantId, drafts)
+  const postings = await resolveDrafts(tx, args.schema, tenantId, drafts, args.shardPicker)
   return { postings, reversesTransitionId: null }
 }
 
 async function resolveDrafts(
   tx: SqlTransaction,
+  schema: SchemaDef,
   tenantId: string,
   drafts: readonly PostingDraft[],
+  shardPicker?: (n: number) => number,
 ): Promise<readonly ResolvedPosting[]> {
   const out: ResolvedPosting[] = []
   for (const d of drafts) {
     const ref = d.account
     if (d.amount < 0n) {
-      throw new UnbalancedPostingsError(0n, 0n)
+      throw new InvalidPostingError('posting amount must be ≥ 0', {
+        direction: d.direction,
+        account: `${ref.actorType}:${ref.actorId}.${ref.accountName}`,
+        amount: d.amount.toString(),
+      })
     }
     // Hot-account sharding (§6.1): for accounts declared with
     // `shards: N`, the engine picks a shard pseudorandomly at write
@@ -868,8 +1155,22 @@ async function resolveDrafts(
         `Posting target account ${ref.actorType}:${ref.actorId}.${ref.accountName} (${ref.currency}) does not exist; provision it via accounts.create() first.`,
       )
     }
-    const pick = ids[Math.floor(Math.random() * ids.length)] as { id: string }
-    out.push({ accountId: pick.id, direction: d.direction, amount: d.amount })
+    const pickIdx = shardPicker
+      ? Math.max(0, Math.min(ids.length - 1, Math.floor(shardPicker(ids.length))))
+      : Math.floor(Math.random() * ids.length)
+    const pick = ids[pickIdx] as { id: string }
+    // Carry the schema's overdraft policy for the M1 enforcement
+    // pass. Defaults to `true` if the actor or account isn't found
+    // — that branch shouldn't happen because the SQL above already
+    // confirmed the row exists.
+    const accountDef = lookupAccountDecl(schema, ref.actorType, ref.accountName)
+    out.push({
+      accountId: pick.id,
+      direction: d.direction,
+      amount: d.amount,
+      currency: ref.currency,
+      allowOverdraft: accountDef?.allowOverdraft ?? true,
+    })
   }
   return out
 }
@@ -878,6 +1179,7 @@ const INVERT_PREFIX = 'invert:'
 
 async function resolveInvertReference(
   tx: SqlTransaction,
+  schema: SchemaDef,
   tenantId: string,
   record: TxnRecord,
   spec: string,
@@ -912,19 +1214,38 @@ async function resolveInvertReference(
     )
   }
 
-  const rows = await tx<{ account_id: string; direction: 'D' | 'C'; amount: string }[]>`
-    select account_id, direction, amount::text as amount
-    from "postings"
-    where transition_id = ${original.id} and tenant_id = ${tenantId}
+  // Join accounts to recover the per-leg currency — drives M16's
+  // per-currency balance assertion on the inverted set.
+  const rows = await tx<
+    { account_id: string; direction: 'D' | 'C'; amount: string; currency: string }[]
+  >`
+    select p.account_id, p.direction, p.amount::text as amount, a.currency
+    from "postings" p
+    join "accounts" a on a.id = p.account_id
+    where p.transition_id = ${original.id} and p.tenant_id = ${tenantId}
   `
   if (rows.length === 0) {
     throw new LokiError(`Original transition ${original.id} has no postings to invert.`)
   }
-  const inverted: ResolvedPosting[] = rows.map((r) => ({
-    accountId: r.account_id,
-    direction: r.direction === 'D' ? ('C' as const) : ('D' as const),
-    amount: BigInt(r.amount),
-  }))
+  // Reversals bypass overdraft enforcement at the call site (M1), but
+  // we still populate `allowOverdraft` faithfully from the schema so
+  // anyone reading the resolved structure sees consistent metadata.
+  // The lookup falls back to `true` for accounts whose actor type
+  // isn't currently in the schema (e.g. mid-rename across versions).
+  const inverted: ResolvedPosting[] = []
+  for (const r of rows) {
+    const [account] = await tx<{ owner_actor_type: string; name: string }[]>`
+      select owner_actor_type, name from "accounts" where id = ${r.account_id}
+    `
+    const def = account ? lookupAccountDecl(schema, account.owner_actor_type, account.name) : null
+    inverted.push({
+      accountId: r.account_id,
+      direction: r.direction === 'D' ? ('C' as const) : ('D' as const),
+      amount: BigInt(r.amount),
+      currency: r.currency,
+      allowOverdraft: def?.allowOverdraft ?? true,
+    })
+  }
   return { postings: inverted, reversesTransitionId: original.id }
 }
 
@@ -949,14 +1270,22 @@ async function lockAccountsInOrder(
   `
 }
 
+/**
+ * Enforces sum(D) === sum(C) per currency (§M16 multi-currency).
+ * An FX transition has multiple currencies, each balanced on its own;
+ * the cross-currency relationship lives in the payload (rate metadata).
+ */
 function assertBalanced(postings: readonly ResolvedPosting[]): void {
-  let debits = 0n
-  let credits = 0n
+  const byCurrency = new Map<string, { debits: bigint; credits: bigint }>()
   for (const p of postings) {
-    if (p.direction === 'D') debits += p.amount
-    else credits += p.amount
+    const slot = byCurrency.get(p.currency) ?? { debits: 0n, credits: 0n }
+    if (p.direction === 'D') slot.debits += p.amount
+    else slot.credits += p.amount
+    byCurrency.set(p.currency, slot)
   }
-  if (debits !== credits) throw new UnbalancedPostingsError(debits, credits)
+  for (const [currency, { debits, credits }] of byCurrency) {
+    if (debits !== credits) throw new UnbalancedPostingsError(debits, credits, currency)
+  }
 }
 
 // =============================================================================
@@ -983,7 +1312,7 @@ function mapRecord(row: Record<string, unknown>): TxnRecord {
   }
 }
 
-function mapTransition(row: Record<string, unknown>): TxnTransition {
+export function mapTransition(row: Record<string, unknown>): TxnTransition {
   return {
     id: row['id'] as string,
     tenantId: row['tenant_id'] as string,
@@ -1009,16 +1338,38 @@ function mapTransition(row: Record<string, unknown>): TxnTransition {
 }
 
 /**
- * Convert a payload that may contain `bigint` values to a JSON-safe
- * representation. postgres.js (and JSON.stringify) reject bigints; we
- * encode them as strings inside `{ "$bigint": "<digits>" }` envelopes
- * so the round-trip is reversible if a reader needs the original
- * value. Everything else passes through unchanged.
+ * Convert a payload that may contain non-JSON-native values to a
+ * JSON-safe representation that round-trips through Postgres JSONB
+ * AND yields the same canonical bytes as the original value when fed
+ * back through `canonicalize`.
+ *
+ * Encodings:
+ *   - `bigint` → `{ "$bigint": "<digits>" }`
+ *   - `Date`   → ISO-8601 string (matches `canonicalize`'s Date output)
+ *   - `Buffer` / `Uint8Array` → hex string (matches the canonicalize
+ *     `$bytes` envelope for hash inputs that read this back).
+ *
+ * H1 fix: previously a `Date` in payload produced `{}` (because
+ * `Object.keys(date)` is empty) which silently diverged from the
+ * write-time hash. Reconciliation read `{}` back, recomputed a
+ * different `row_hash`, and reported a false `hash_chain_break` on
+ * every sweep.
  */
-function jsonifyForStorage(value: unknown): unknown {
+export function jsonifyForStorage(value: unknown): unknown {
   if (value === null || value === undefined) return value
   if (typeof value === 'bigint') return { $bigint: value.toString() }
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) {
+      throw new LokiError('Invalid Date in payload — cannot store in jsonb.')
+    }
+    return value.toISOString()
+  }
   if (Array.isArray(value)) return value.map(jsonifyForStorage)
+  if (value instanceof Uint8Array) {
+    // Wrap in the same envelope `canonicalize` emits for byte values
+    // so the round-trip through JSONB rehashes to the same bytes.
+    return { $bytes: Buffer.from(value).toString('hex') }
+  }
   if (typeof value === 'object') {
     const v = value as Record<string, unknown>
     const out: Record<string, unknown> = {}
@@ -1037,6 +1388,49 @@ function mapPosting(row: Record<string, unknown>): Posting {
     amount: BigInt((row['amount'] as { toString(): string }).toString()),
     direction: row['direction'] as 'D' | 'C',
     occurredAt: row['occurred_at'] as Date,
+  }
+}
+
+type ProjectionSourceRow = {
+  readonly id: string
+  readonly tenant_id: string
+  readonly txn_id: string
+  readonly type: string
+  readonly name: string
+  readonly from_state: string | null
+  readonly to_state: string
+  readonly actor_type: string
+  readonly actor_id: string
+  readonly schema_version: number
+  readonly occurred_at: Date
+}
+
+/**
+ * Materialized-projection write-path (§12.9). Called inside the same
+ * transition tx as the source `txn_transitions` insert — the
+ * projection cannot lag because nothing commits without it. Skipped
+ * silently when the schema declares no projections, so the cost is a
+ * cheap loop check, not a per-write round-trip.
+ */
+async function writeProjections(
+  tx: SqlTransaction,
+  schema: SchemaDef,
+  source: ProjectionSourceRow,
+): Promise<void> {
+  if (schema.projections.length === 0) return
+  for (const projection of schema.projections) {
+    if (projection.when?.actorType && projection.when.actorType !== source.actor_type) {
+      continue
+    }
+    const cols = projection.columns
+    const values = cols.map((c) => source[c as keyof ProjectionSourceRow] ?? null)
+    const colList = cols.map((c) => `"${c}"`).join(', ')
+    const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ')
+    const tableName = `proj_${projection.name}`
+    await tx.unsafe(
+      `INSERT INTO "${tableName}" (${colList}) VALUES (${placeholders}) ON CONFLICT (id) DO NOTHING`,
+      values as never,
+    )
   }
 }
 

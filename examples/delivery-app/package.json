@@ -1,0 +1,20 @@
+{
+  "name": "loki-example-delivery-app",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Two-sided marketplace example for @loki/core. User pays, driver gets paid, company takes a fee. Refund via capability key.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "migrate": "tsx src/migrate.ts",
+    "start": "tsx src/main.ts"
+  },
+  "dependencies": {
+    "@loki/core": "workspace:*",
+    "@standard-schema/spec": "1.0.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.3"
+  }
+}

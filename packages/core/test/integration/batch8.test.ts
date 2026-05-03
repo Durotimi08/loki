@@ -17,6 +17,7 @@ import {
   type Engine,
   type IntegrityViolationEvent,
   MIGRATIONS_TABLE,
+  RECONCILER_STATE_TABLE,
   type ReconciliationCompleteEvent,
   type ReversalEvent,
   type SchemaMigrationEvent,
@@ -49,6 +50,7 @@ beforeEach(async () => {
       /* fine */
     }
     await engine.connection.sql.unsafe(`drop table if exists ${MIGRATIONS_TABLE}`)
+    await engine.connection.sql.unsafe(`drop table if exists ${RECONCILER_STATE_TABLE}`)
     await engine.close()
   }
   engine = createEngine({ schema: chidoriSchema, connection: { url: dbUrl } })
@@ -199,15 +201,16 @@ describe('reconciler — drift auto-repair', () => {
       `update "accounts" set balance = 999 where owner_actor_type = 'User' and owner_actor_id = 'u-repair'`,
     )
 
-    const before = await engine.reconciler.runOnce({ quarantine: false })
-    expect(before.anomalies.some((a) => a.check === 'balance_drift')).toBe(true)
-    expect(before.repaired).toEqual([])
-
-    const after = await engine.reconciler.runOnce({
+    // Detect + repair in one pass — that's the production usage. The
+    // per-check watermark only re-examines accounts whose postings
+    // have moved since last sweep, so a detect-only pass followed by
+    // a repair-only pass would skip the second one.
+    const result = await engine.reconciler.runOnce({
       quarantine: false,
       repairBalanceDrift: true,
     })
-    expect(after.repaired.length).toBeGreaterThan(0)
+    expect(result.anomalies.some((a) => a.check === 'balance_drift')).toBe(true)
+    expect(result.repaired.length).toBeGreaterThan(0)
 
     // Drift gone; postings sum is the truth (1500n debited from a 0
     // starting balance → -1500n).
@@ -220,7 +223,9 @@ describe('reconciler — drift auto-repair', () => {
       }),
     ).toBe(-1500n)
 
-    const clean = await engine.reconciler.runOnce({ quarantine: false })
+    // A subsequent fullSweep confirms no drift remains (the watermarked
+    // pass would skip the now-quiet account anyway).
+    const clean = await engine.reconciler.runOnce({ quarantine: false, fullSweep: true })
     expect(clean.anomalies.some((a) => a.check === 'balance_drift')).toBe(false)
   })
 })

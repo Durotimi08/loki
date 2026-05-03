@@ -18,9 +18,15 @@ export type {
   TransitionFactory,
 } from './schema/transaction.js'
 
-export { defineSchema, diffSchemas } from './schema/schema.js'
-export type { ChangeKind, SchemaChange, SchemaDiff, SchemaInputArgs } from './schema/schema.js'
-export type { AliasMap } from './schema/types.js'
+export { defineProjection, defineSchema, diffSchemas } from './schema/schema.js'
+export type {
+  ChangeKind,
+  ProjectionInput,
+  SchemaChange,
+  SchemaDiff,
+  SchemaInputArgs,
+} from './schema/schema.js'
+export type { AliasMap, ProjectionColumn, ProjectionDef } from './schema/types.js'
 
 // --- schema types (runtime + type-only) ---
 export type {
@@ -58,15 +64,40 @@ export { SchemaError } from './schema/errors.js'
 export type { SchemaIssue, SchemaIssueCode } from './schema/errors.js'
 
 // --- primitives ---
-export { isBalanced, sumByDirection } from './primitives/posting.js'
+export { isBalanced, sumByDirection, sumByDirectionPerCurrency } from './primitives/posting.js'
 export {
   ZERO,
+  defineCurrency,
+  defineCurrencyMap,
   formatMinor,
   isNonNegative,
   isPositive,
+  splitAmount,
 } from './primitives/currency.js'
-export type { CurrencyCode } from './primitives/currency.js'
+export type {
+  CurrencyCode,
+  CurrencyDefInput,
+  CurrencyMap,
+  CurrencyMeta,
+  RoundingMode,
+} from './primitives/currency.js'
 export { ULID_REGEX, ulid } from './primitives/ulid.js'
+export {
+  SIGNATURE_HEADER,
+  TIMESTAMP_HEADER,
+  signOutboxPayload,
+  verifyInboundSignature,
+} from './primitives/hmac.js'
+export type { SignedHeaders, VerifyOptions } from './primitives/hmac.js'
+export {
+  DEFAULT_ALGORITHM as PAYLOAD_CRYPTO_DEFAULT_ALGORITHM,
+  ENCRYPTED_KEY,
+  ENVELOPE_VERSION,
+  decryptPayload,
+  encryptPayload,
+  isEncryptedEnvelope,
+} from './primitives/payload-crypto.js'
+export type { PayloadCrypto } from './primitives/payload-crypto.js'
 
 // --- DDL / migrations ---
 export {
@@ -95,6 +126,7 @@ export type {
   EngineTable,
   MigrationOptions,
   MigrationPlan,
+  PartitioningStrategy,
   ResolvedMigrationOptions,
   TenancyMode,
 } from './db/index.js'
@@ -115,6 +147,7 @@ export {
   computePostingsChecksum,
   computeRowHash,
   createEngine,
+  BeforeTransitionTimeoutError,
   createHookRegistry,
   createMigrator,
   createReconciler,
@@ -122,6 +155,8 @@ export {
   DEFAULT_SEVERITY,
   ENGINE_TENANT_GUC,
   IllegalStateTransitionError,
+  InvalidPostingError,
+  OverdraftError,
   isSagaSuccess,
   KeyAlreadyConsumedError,
   LokiError,
@@ -130,7 +165,22 @@ export {
   matchesHookFilter,
   MIGRATIONS_TABLE,
   MigrationMismatchError,
+  RECONCILER_STATE_TABLE,
+  buildPartitionsOps,
+  buildFxOps,
+  buildHoldsOps,
+  buildDisputesOps,
+  buildScheduler,
+  buildInstruments,
+  NOOP_METRICS,
+  NOOP_TRACER,
+  DEFAULT_POOL_OPTIONS,
+  gracefulShutdown,
+  installShutdownHandlers,
+  compareLsn,
+  nextFireMs,
   openConnection,
+  withSearchPath,
   recordAnomaly,
   RejectTransition,
   sha256Hasher,
@@ -174,15 +224,33 @@ export type {
   CanonicalValue,
   Connection,
   ConnectionInput,
+  Counter,
+  EngineInstruments,
+  EngineLike,
+  GracefulShutdownOptions,
+  ShutdownTarget,
+  Gauge,
+  Histogram,
+  MetricLabels,
+  MetricsAdapter,
+  Span,
+  SpanStatus,
+  Tracer,
+  ReadYourWritesMode,
+  RuntimeRoles,
   CreateAccountInput,
   CreateRecordInput,
   CreateRecordResult,
   CreateTenantInput,
   Cursor,
   DateLike,
+  DatabaseHealth,
   Engine,
   EngineOptions,
   EnginePosting,
+  HealthCheckOptions,
+  HealthReport,
+  ReplicaHealth,
   FindManyAnomaliesArgs,
   FindManyPostingsArgs,
   FindManyTransactionsArgs,
@@ -192,6 +260,7 @@ export type {
   HookFilter,
   HookHandler,
   HookRegistry,
+  HookRegistryOptions,
   HookUnsubscribe,
   IntegrityViolationEvent,
   Migrator,
@@ -210,12 +279,43 @@ export type {
   Reconciler,
   ReconcilerContext,
   ReconcilerHandle,
+  ReconcilerSchedule,
   ReconcilerStartOptions,
   ReconciliationCompleteEvent,
   RecordOps,
   ReversalEvent,
   RunOnceOptions,
   RunOnceResult,
+  RunDueOptions,
+  RunDueResult,
+  EnsureForOptions,
+  EnsuredPartition,
+  PartitionTable,
+  PartitionsOps,
+  FxOps,
+  FxRate,
+  FxRateHistoryInput,
+  LookupFxRateInput,
+  PublishFxRateInput,
+  Hold,
+  HoldStatus,
+  HoldsOps,
+  PlaceHoldInput,
+  ReleaseHoldInput,
+  ExpireHoldsResult,
+  Dispute,
+  DisputeStatus,
+  DisputesOps,
+  OpenDisputeInput,
+  ResolveDisputeInput,
+  ExpireDisputesResult,
+  ScheduledTransition,
+  ScheduledTransitionStatus,
+  Scheduler,
+  SchedulerWorkerHandle,
+  SchedulerWorkerOptions,
+  ListScheduledFilter,
+  CreateScheduledTransitionInput,
   SagaContext,
   SagaOptions,
   SagaResult,
@@ -236,4 +336,4 @@ export type {
 } from './engine/index.js'
 
 // --- meta ---
-export { LOKI_CORE_VERSION } from './version.js'
+export { LOKI_CORE_VERSION, LOKI_COMPAT_MAJOR, assertMinCompat } from './version.js'

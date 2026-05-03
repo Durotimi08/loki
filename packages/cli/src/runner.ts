@@ -1,8 +1,10 @@
 import { parseArgs } from 'node:util'
-import { runMigrate } from './commands/migrate.js'
+import { runAnomalies } from './commands/anomalies.js'
+import { runMigrate, runMigrateEnforce } from './commands/migrate.js'
 import { runReconcile } from './commands/reconcile.js'
 import { runSchema } from './commands/schema.js'
 import { runTenant } from './commands/tenant.js'
+import { runTrace } from './commands/trace.js'
 import { type LokiConfig, loadConfig } from './config.js'
 import { type Io, stdIo } from './io.js'
 
@@ -24,6 +26,9 @@ Commands:
   migrate plan                Print up/down SQL for every migration
   migrate rollback            Roll back the most recent migration
   migrate status              Show applied vs pending migrations
+  migrate enforce <name>      Find records violating a new invariant
+                              (uses enforcers[<name>] from loki.config)
+                              [--tenant <id>] [--limit N]
 
   reconcile [--tenant <id>]   Run a single reconciliation pass
                               (exit 1 if any anomalies are detected)
@@ -35,9 +40,18 @@ Commands:
   tenant suspend <id>
   tenant activate <id>
   tenant delete <id>
+  tenant dashboard <id>       Per-tenant rollup: counts, anomalies, schema versions
 
   schema versions [--tenant <id>]
   schema diff --from <config-path>
+
+  anomalies list --tenant <id> [--severity warn|error|critical]
+                                [--check <name>] [--unresolved] [--limit N]
+  anomalies resolve <id> --tenant <id> --by <name> --note <text>
+
+  trace <txnId> --tenant <id> [--verify]
+                              Print the full transition trail for a record;
+                              --verify recomputes the hash chain.
 
 Global flags:
   --config <path>             Path to a loki.config.{js,mjs,ts} module
@@ -80,6 +94,10 @@ export async function run(options: RunnerOptions): Promise<number> {
         return await runTenantCommand(config, rest, io)
       case 'schema':
         return await runSchemaCommand(config, rest, io)
+      case 'anomalies':
+        return await runAnomaliesCommand(config, rest, io)
+      case 'trace':
+        return await runTraceCommand(config, rest, io)
       default:
         io.err(`Unknown command: ${command ?? '<missing>'}`)
         io.err(HELP)
@@ -115,9 +133,40 @@ async function runMigrateCommand(
   io: Io,
 ): Promise<number> {
   const sub = args[0]
+  if (sub === 'enforce') {
+    const rest = args.slice(1)
+    const parsed = parseArgs({
+      args: [...rest],
+      options: {
+        tenant: { type: 'string' },
+        limit: { type: 'string' },
+      },
+      allowPositionals: true,
+      strict: true,
+    })
+    const enforcerName = parsed.positionals[0]
+    if (!enforcerName) {
+      io.err('migrate enforce: usage: migrate enforce <enforcer-name> [--tenant <id>] [--limit N]')
+      return 2
+    }
+    const limit = parsed.values.limit ? Number(parsed.values.limit) : undefined
+    if (limit !== undefined && (!Number.isFinite(limit) || limit <= 0)) {
+      io.err('migrate enforce: --limit must be a positive integer.')
+      return 2
+    }
+    return runMigrateEnforce(
+      config,
+      {
+        enforcerName,
+        ...(parsed.values.tenant ? { tenant: parsed.values.tenant } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+      },
+      io,
+    )
+  }
   if (!sub || !['apply', 'plan', 'rollback', 'status'].includes(sub)) {
     io.err(
-      `migrate: expected one of apply | plan | rollback | status, got "${sub ?? '<missing>'}".`,
+      `migrate: expected one of apply | plan | rollback | status | enforce, got "${sub ?? '<missing>'}".`,
     )
     return 2
   }
@@ -176,7 +225,8 @@ async function runTenantCommand(
     case 'get':
     case 'suspend':
     case 'activate':
-    case 'delete': {
+    case 'delete':
+    case 'dashboard': {
       const id = rest[0]
       if (!id) {
         io.err(`tenant ${sub}: usage: tenant ${sub} <id>`)
@@ -232,4 +282,108 @@ async function runSchemaCommand(
       io.err(`schema: unknown subcommand "${sub ?? '<missing>'}".`)
       return 2
   }
+}
+
+async function runAnomaliesCommand(
+  config: LokiConfig,
+  args: readonly string[],
+  io: Io,
+): Promise<number> {
+  const sub = args[0]
+  const rest = args.slice(1)
+  switch (sub) {
+    case 'list': {
+      const parsed = parseArgs({
+        args: [...rest],
+        options: {
+          tenant: { type: 'string' },
+          severity: { type: 'string' },
+          check: { type: 'string' },
+          unresolved: { type: 'boolean' },
+          limit: { type: 'string' },
+        },
+        allowPositionals: false,
+        strict: true,
+      })
+      const sev = parsed.values.severity
+      if (sev !== undefined && sev !== 'warn' && sev !== 'error' && sev !== 'critical') {
+        io.err(`anomalies list: --severity must be one of warn|error|critical (got "${sev}").`)
+        return 2
+      }
+      const limit = parsed.values.limit ? Number(parsed.values.limit) : undefined
+      if (limit !== undefined && (!Number.isFinite(limit) || limit <= 0)) {
+        io.err('anomalies list: --limit must be a positive integer.')
+        return 2
+      }
+      return runAnomalies(
+        config,
+        {
+          kind: 'list',
+          ...(parsed.values.tenant !== undefined ? { tenant: parsed.values.tenant } : {}),
+          ...(sev !== undefined ? { severity: sev as 'warn' | 'error' | 'critical' } : {}),
+          ...(parsed.values.check !== undefined ? { check: parsed.values.check } : {}),
+          ...(parsed.values.unresolved === true ? { unresolvedOnly: true } : {}),
+          ...(limit !== undefined ? { limit } : {}),
+        },
+        io,
+      )
+    }
+    case 'resolve': {
+      const parsed = parseArgs({
+        args: [...rest],
+        options: {
+          tenant: { type: 'string' },
+          by: { type: 'string' },
+          note: { type: 'string' },
+        },
+        allowPositionals: true,
+        strict: true,
+      })
+      const id = parsed.positionals[0]
+      const tenant = parsed.values.tenant
+      const by = parsed.values.by
+      const note = parsed.values.note
+      if (!id || !tenant || !by || !note) {
+        io.err(
+          'anomalies resolve: usage: anomalies resolve <id> --tenant <id> --by <name> --note <text>',
+        )
+        return 2
+      }
+      return runAnomalies(config, { kind: 'resolve', id, tenant, by, note }, io)
+    }
+    default:
+      io.err(`anomalies: unknown subcommand "${sub ?? '<missing>'}".`)
+      return 2
+  }
+}
+
+async function runTraceCommand(
+  config: LokiConfig,
+  args: readonly string[],
+  io: Io,
+): Promise<number> {
+  const parsed = parseArgs({
+    args: [...args],
+    options: {
+      tenant: { type: 'string' },
+      verify: { type: 'boolean' },
+    },
+    allowPositionals: true,
+    strict: true,
+  })
+  const txnId = parsed.positionals[0]
+  const tenant = parsed.values.tenant
+  if (!txnId || !tenant) {
+    io.err('trace: usage: trace <txnId> --tenant <id> [--verify]')
+    return 2
+  }
+  return runTrace(
+    config,
+    {
+      kind: parsed.values.verify === true ? 'verify' : 'show',
+      tenant,
+      txnId,
+    },
+    io,
+  )
 }

@@ -228,3 +228,247 @@ describe('loki reconcile', () => {
     expect(io.stdout()).toContain('balance_drift')
   })
 })
+
+describe('loki anomalies', () => {
+  it('list reports drift detected by reconcile and resolve closes it', async () => {
+    const cfg = config()
+    if (!cfg || !engine) return
+    await run({ args: ['migrate', 'apply'], io: bufferedIo(), config: cfg })
+    await run({
+      args: ['tenant', 'create', 'org-an', '--name', 'A'],
+      io: bufferedIo(),
+      config: cfg,
+    })
+
+    // Seed an anomaly: corrupt balance, then reconcile to record it.
+    const client = engine.forTenant('org-an')
+    await client.accounts.create({ actor: { type: 'User', id: 'u-1' }, name: 'wallet' })
+    await engine.connection.sql.unsafe(
+      `update "accounts" set balance = 999 where owner_actor_type = 'User' and owner_actor_id = 'u-1'`,
+    )
+    await run({
+      args: ['reconcile', '--tenant', 'org-an', '--no-quarantine'],
+      io: bufferedIo(),
+      config: cfg,
+    })
+
+    const list = bufferedIo()
+    expect(
+      await run({
+        args: ['anomalies', 'list', '--tenant', 'org-an'],
+        io: list,
+        config: cfg,
+      }),
+    ).toBe(0)
+    expect(list.stdout()).toContain('balance_drift')
+
+    // Pull the anomaly id out of the list output so we can resolve it.
+    const idMatch = /^([0-9a-f-]{36})/m.exec(list.stdout())
+    expect(idMatch).not.toBeNull()
+    const id = (idMatch as RegExpExecArray)[1] as string
+
+    const resolveIo = bufferedIo()
+    expect(
+      await run({
+        args: [
+          'anomalies',
+          'resolve',
+          id,
+          '--tenant',
+          'org-an',
+          '--by',
+          'tester',
+          '--note',
+          'manual fix',
+        ],
+        io: resolveIo,
+        config: cfg,
+      }),
+    ).toBe(0)
+    expect(resolveIo.stdout()).toContain('Resolved')
+
+    const after = bufferedIo()
+    await run({
+      args: ['anomalies', 'list', '--tenant', 'org-an', '--unresolved'],
+      io: after,
+      config: cfg,
+    })
+    expect(after.stdout()).toContain('No anomalies.')
+  })
+
+  it('returns 2 when --tenant is missing', async () => {
+    const cfg = config()
+    if (!cfg) return
+    await run({ args: ['migrate', 'apply'], io: bufferedIo(), config: cfg })
+    const io = bufferedIo()
+    expect(await run({ args: ['anomalies', 'list'], io, config: cfg })).toBe(2)
+    expect(io.stderr()).toContain('--tenant')
+  })
+})
+
+describe('loki trace', () => {
+  it('prints the transition trail and verify reports OK on a clean record', async () => {
+    const cfg = config()
+    if (!cfg || !engine) return
+    await run({ args: ['migrate', 'apply'], io: bufferedIo(), config: cfg })
+    await run({
+      args: ['tenant', 'create', 'org-tr', '--name', 'T'],
+      io: bufferedIo(),
+      config: cfg,
+    })
+
+    const client = engine.forTenant('org-tr')
+    const user = { type: 'User', id: 'u-t' }
+    const driver = { type: 'Driver', id: 'd-t' }
+    await client.accounts.create({ actor: user, name: 'wallet' })
+    await client.accounts.create({ actor: driver, name: 'balance' })
+    const txn = await client.transactions.create({
+      type: 'Simple',
+      by: user,
+      participants: { user, driver },
+      idempotencyKey: 'trace:1',
+    })
+    await client.transactions.transition({
+      id: txn.record.id,
+      name: 'finish',
+      by: user,
+      idempotencyKey: 'trace:1:finish',
+    })
+
+    const showIo = bufferedIo()
+    expect(
+      await run({
+        args: ['trace', txn.record.id, '--tenant', 'org-tr'],
+        io: showIo,
+        config: cfg,
+      }),
+    ).toBe(0)
+    expect(showIo.stdout()).toContain(`Record:    ${txn.record.id}`)
+    expect(showIo.stdout()).toContain('finish')
+
+    const verifyIo = bufferedIo()
+    expect(
+      await run({
+        args: ['trace', txn.record.id, '--tenant', 'org-tr', '--verify'],
+        io: verifyIo,
+        config: cfg,
+      }),
+    ).toBe(0)
+    expect(verifyIo.stdout()).toContain('Verified:  YES')
+  })
+
+  it('exits 1 when the txnId is unknown', async () => {
+    const cfg = config()
+    if (!cfg) return
+    await run({ args: ['migrate', 'apply'], io: bufferedIo(), config: cfg })
+    await run({
+      args: ['tenant', 'create', 'org-tr2', '--name', 'T2'],
+      io: bufferedIo(),
+      config: cfg,
+    })
+    const io = bufferedIo()
+    const code = await run({
+      args: ['trace', '00000000-0000-0000-0000-000000000000', '--tenant', 'org-tr2'],
+      io,
+      config: cfg,
+    })
+    expect(code).toBe(1)
+    expect(io.stderr()).toContain('No record')
+  })
+})
+
+describe('loki migrate enforce', () => {
+  it('returns 1 + lists records that violate a configured invariant', async () => {
+    const cfg = config()
+    if (!cfg || !engine) return
+    const enforced: LokiConfig = {
+      ...cfg,
+      enforcers: {
+        finished_only: {
+          txnType: 'Simple',
+          // Predicate flags every `finish` transition as a violation.
+          // In real life this would be a tighter `min_amount` style rule.
+          predicate: (t) => t.name === 'finish',
+          description: 'finished_only: every finish transition is suspect',
+        },
+      },
+    }
+    await run({ args: ['migrate', 'apply'], io: bufferedIo(), config: enforced })
+    await run({
+      args: ['tenant', 'create', 'org-en', '--name', 'En'],
+      io: bufferedIo(),
+      config: enforced,
+    })
+    const c = engine.forTenant('org-en')
+    const user = { type: 'User', id: 'u-en' }
+    const driver = { type: 'Driver', id: 'd-en' }
+    await c.accounts.create({ actor: user, name: 'wallet' })
+    await c.accounts.create({ actor: driver, name: 'balance' })
+    const txn = await c.transactions.create({
+      type: 'Simple',
+      by: user,
+      participants: { user, driver },
+      idempotencyKey: 'en:1:create',
+    })
+    await c.transactions.transition({
+      id: txn.record.id,
+      name: 'finish',
+      by: user,
+      idempotencyKey: 'en:1:finish',
+    })
+
+    const io = bufferedIo()
+    const code = await run({
+      args: ['migrate', 'enforce', 'finished_only', '--tenant', 'org-en'],
+      io,
+      config: enforced,
+    })
+    expect(code).toBe(1)
+    expect(io.stdout()).toContain('Found 1 violation')
+    expect(io.stdout()).toContain(`record=${txn.record.id}`)
+  })
+
+  it('returns 2 when no enforcer with that name exists', async () => {
+    const cfg = config()
+    if (!cfg) return
+    await run({ args: ['migrate', 'apply'], io: bufferedIo(), config: cfg })
+    const io = bufferedIo()
+    const code = await run({
+      args: ['migrate', 'enforce', 'does_not_exist'],
+      io,
+      config: cfg,
+    })
+    expect(code).toBe(2)
+    expect(io.stderr()).toContain('no enforcer')
+  })
+})
+
+describe('loki tenant dashboard', () => {
+  it('reports a per-tenant rollup', async () => {
+    const cfg = config()
+    if (!cfg || !engine) return
+    await run({ args: ['migrate', 'apply'], io: bufferedIo(), config: cfg })
+    await run({
+      args: ['tenant', 'create', 'org-d', '--name', 'Dash'],
+      io: bufferedIo(),
+      config: cfg,
+    })
+    const client = engine.forTenant('org-d')
+    const user = { type: 'User', id: 'u-d' }
+    const driver = { type: 'Driver', id: 'd-d' }
+    await client.accounts.create({ actor: user, name: 'wallet' })
+    await client.accounts.create({ actor: driver, name: 'balance' })
+    await client.transactions.create({
+      type: 'Simple',
+      by: user,
+      participants: { user, driver },
+      idempotencyKey: 'd:1',
+    })
+
+    const io = bufferedIo()
+    expect(await run({ args: ['tenant', 'dashboard', 'org-d'], io, config: cfg })).toBe(0)
+    expect(io.stdout()).toContain('Tenant: org-d (Dash)')
+    expect(io.stdout()).toContain('Records:            1')
+    expect(io.stdout()).toContain('Open anomalies:     0')
+  })
+})

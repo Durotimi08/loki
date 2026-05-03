@@ -1,8 +1,10 @@
+import type { PayloadCrypto } from '../primitives/payload-crypto.js'
 import type { SchemaDef } from '../schema/types.js'
 import { type AccountOps, buildAccountOps } from './accounts.js'
 import type { Connection } from './connection.js'
 import type { Hasher } from './hash.js'
 import type { HookRegistry } from './hooks.js'
+import type { EngineInstruments } from './observability.js'
 import { type QueryOps, buildQueryOps } from './queries.js'
 import { type RecordOps, buildRecordOps } from './records.js'
 
@@ -33,6 +35,10 @@ export function buildTenantClient(opts: {
   connection: Connection
   hasher: Hasher
   hooks: HookRegistry
+  shardPicker?: (n: number) => number
+  clock?: () => Date
+  payloadCrypto?: PayloadCrypto
+  instruments?: EngineInstruments
 }): TenantClient {
   return {
     tenantId: opts.tenantId,
@@ -43,7 +49,13 @@ export function buildTenantClient(opts: {
       connection: opts.connection,
       hasher: opts.hasher,
       hooks: opts.hooks,
+      ...(opts.shardPicker !== undefined ? { shardPicker: opts.shardPicker } : {}),
+      ...(opts.clock !== undefined ? { clock: opts.clock } : {}),
+      ...(opts.payloadCrypto !== undefined ? { payloadCrypto: opts.payloadCrypto } : {}),
+      ...(opts.instruments !== undefined ? { instruments: opts.instruments } : {}),
     }),
-    queries: buildQueryOps(opts.tenantId, opts.connection),
+    queries: buildQueryOps(opts.tenantId, opts.connection, {
+      ...(opts.payloadCrypto !== undefined ? { payloadCrypto: opts.payloadCrypto } : {}),
+    }),
   }
 }

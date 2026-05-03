@@ -141,11 +141,16 @@ export type TransitionInputArgs = {
   readonly name: string
   readonly by: ActorRef
   readonly idempotencyKey: string
-  readonly data?: Record<string, unknown>
-  /** ID of an active capability key being consumed (the engine verifies it). */
-  readonly withKey?: string
+  readonly data?: Record<string, unknown> | undefined
+  /**
+   * ID of an active capability key being consumed (the engine verifies it).
+   * `string | undefined` (not just `string?`) so callers can pass the
+   * result of `r.unlocked.foo` (a `string | undefined` lookup) directly
+   * without narrowing under `exactOptionalPropertyTypes: true`.
+   */
+  readonly withKey?: string | undefined
   /** Optional trace id propagated to the audit log and outbox. */
-  readonly traceId?: string
+  readonly traceId?: string | undefined
 }
 
 export type TransitionResult = {

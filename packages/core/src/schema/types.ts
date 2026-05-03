@@ -27,6 +27,16 @@ export type AccountOptions = {
    * Used for sub-accounts.
    */
   readonly parent?: string
+  /**
+   * If `false`, the engine refuses any transition that would take this
+   * account's balance below zero — `OverdraftError` thrown pre-commit
+   * so the tx rolls back. Default `true` for back-compat (existing
+   * schemas continue to allow negative balances). Sharded accounts
+   * cannot disable overdraft because the constraint is on the sum
+   * across shards but writers update one shard each, racing the check;
+   * `defineActor` rejects the combination at schema-build time.
+   */
+  readonly allowOverdraft?: boolean
 }
 
 export type AccountDef<TActorName extends string = string, TAccountName extends string = string> = {
@@ -36,6 +46,7 @@ export type AccountDef<TActorName extends string = string, TAccountName extends 
   readonly currency: CurrencyCode
   readonly shards: number
   readonly parent?: string
+  readonly allowOverdraft: boolean
 }
 
 // =============================================================================
@@ -254,6 +265,50 @@ export type AliasMap = {
   readonly accounts?: Readonly<Record<string, Readonly<Record<string, string>>>>
 }
 
+/**
+ * Materialized projection (§12.9). The engine maintains a denormalized
+ * `proj_<name>` table inside the same DB transaction as the source
+ * write, so reads are O(1) and there's no eventual consistency to
+ * reason about. Use this when an actor-centric query path becomes hot
+ * enough that index scans on the source aren't fast enough.
+ */
+export type ProjectionDef = {
+  readonly _kind: 'projection'
+  readonly name: string
+  /**
+   * Source table the projection follows. v1: `txn_transitions` only —
+   * postings/account-history projections will land later when there's
+   * a proven workload that needs them.
+   */
+  readonly source: 'txn_transitions'
+  /**
+   * Optional structural filter. Right now only `actorType` — most hot
+   * dashboards are "this driver's recent activity" / "this user's
+   * recent transitions", and the actor type is the natural shard key.
+   */
+  readonly when?: { readonly actorType: string }
+  /**
+   * Columns to copy from the source row into the projection. The names
+   * must match the source table's column names verbatim. The engine
+   * always includes `tenant_id` even if it's not listed, so the RLS
+   * policy can scope the projection.
+   */
+  readonly columns: readonly ProjectionColumn[]
+}
+
+export type ProjectionColumn =
+  | 'id'
+  | 'tenant_id'
+  | 'txn_id'
+  | 'type'
+  | 'name'
+  | 'from_state'
+  | 'to_state'
+  | 'actor_type'
+  | 'actor_id'
+  | 'occurred_at'
+  | 'schema_version'
+
 export type SchemaDef<
   TTenant extends TenantDef = TenantDef,
   TActors extends readonly ActorDef[] = readonly ActorDef[],
@@ -271,6 +326,8 @@ export type SchemaDef<
   readonly version: number
   /** Per-version alias maps for renames. Key is the version that produced rows. */
   readonly aliases: Readonly<Record<number, AliasMap>>
+  /** Materialized projections (§12.9). Maintained synchronously by the engine. */
+  readonly projections: readonly ProjectionDef[]
   readonly meta: {
     /** Map of actor name → ActorDef. Built once at `defineSchema`. */
     readonly actorsByName: ReadonlyMap<string, ActorDef>

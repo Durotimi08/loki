@@ -12,6 +12,21 @@ export type TenancyMode =
   /** Each tenant gets its own database. (Reserved — lands later.) */
   | 'database-per-tenant'
 
+export type PartitioningStrategy =
+  /** No partitioning. txn_transitions and postings are flat tables. Default. */
+  | 'none'
+  /**
+   * Monthly RANGE partitioning by `occurred_at` on `txn_transitions`
+   * and `postings` (§12.3). Keeps VACUUM cost bounded, makes
+   * archival cheap, and lets reconciliation scope to recent
+   * partitions. Postgres requires the partition key in every PK
+   * and unique constraint, so partitioned mode also widens the
+   * relevant indexes and drops the cross-table FKs to the
+   * partitioned tables — integrity is enforced by the hash chain
+   * and the reconciler instead.
+   */
+  | 'monthly'
+
 export type MigrationOptions = {
   /** Tenancy isolation mode. M1 only implements `rls`. */
   readonly tenancy?: TenancyMode
@@ -24,6 +39,11 @@ export type MigrationOptions = {
    * `${prefix}tenants`, `${prefix}txn_records`, etc. Empty by default.
    */
   readonly tablePrefix?: string
+  /**
+   * Partition `txn_transitions` and `postings` by `occurred_at`. See
+   * `PartitioningStrategy`. Default `'none'`.
+   */
+  readonly partitioning?: PartitioningStrategy
 }
 
 export type ResolvedMigrationOptions = {
@@ -31,6 +51,7 @@ export type ResolvedMigrationOptions = {
   readonly appRole: string
   readonly adminRole: string
   readonly tablePrefix: string
+  readonly partitioning: PartitioningStrategy
 }
 
 export const DEFAULT_OPTIONS: ResolvedMigrationOptions = {
@@ -38,14 +59,40 @@ export const DEFAULT_OPTIONS: ResolvedMigrationOptions = {
   appRole: 'ledger_app',
   adminRole: 'ledger_admin',
   tablePrefix: '',
+  partitioning: 'none',
 }
 
+/**
+ * Anything that ends up concatenated into a SQL identifier (table
+ * names, partition names, role names) must match this regex.
+ * H6 fix: previously the partitions module string-concatenated
+ * `tablePrefix` into DDL without validation; a misconfigured
+ * deployment could inject SQL.
+ */
+const SAFE_IDENTIFIER_PART = /^[A-Za-z_][A-Za-z0-9_]*$/
+const SAFE_IDENTIFIER_PREFIX = /^([A-Za-z_][A-Za-z0-9_]*)?$/
+
 export function resolveOptions(options: MigrationOptions = {}): ResolvedMigrationOptions {
+  const tablePrefix = options.tablePrefix ?? DEFAULT_OPTIONS.tablePrefix
+  if (!SAFE_IDENTIFIER_PREFIX.test(tablePrefix)) {
+    throw new Error(
+      `tablePrefix "${tablePrefix}" must be empty or match [A-Za-z_][A-Za-z0-9_]* (no quotes, spaces, or punctuation).`,
+    )
+  }
+  const appRole = options.appRole ?? DEFAULT_OPTIONS.appRole
+  if (!SAFE_IDENTIFIER_PART.test(appRole)) {
+    throw new Error(`appRole "${appRole}" must match [A-Za-z_][A-Za-z0-9_]*.`)
+  }
+  const adminRole = options.adminRole ?? DEFAULT_OPTIONS.adminRole
+  if (!SAFE_IDENTIFIER_PART.test(adminRole)) {
+    throw new Error(`adminRole "${adminRole}" must match [A-Za-z_][A-Za-z0-9_]*.`)
+  }
   return {
     tenancy: options.tenancy ?? DEFAULT_OPTIONS.tenancy,
-    appRole: options.appRole ?? DEFAULT_OPTIONS.appRole,
-    adminRole: options.adminRole ?? DEFAULT_OPTIONS.adminRole,
-    tablePrefix: options.tablePrefix ?? DEFAULT_OPTIONS.tablePrefix,
+    appRole,
+    adminRole,
+    tablePrefix,
+    partitioning: options.partitioning ?? DEFAULT_OPTIONS.partitioning,
   }
 }
 
@@ -63,6 +110,15 @@ export const ENGINE_TABLES = [
   'postings',
   'outbox',
   'txn_anomalies',
+  'txn_scheduled',
+  // M16 — FX rates table (Batch D). Tenant-scoped time-series of
+  // base/quote/rate tuples. Reconciler reads it to verify rate-pinned
+  // transitions; runtime helpers `engine.fx.publish/lookup/history` are
+  // the typed surface.
+  'fx_rates',
+  // M17 — first-class holds + disputes (Batch E).
+  'txn_holds',
+  'txn_disputes',
 ] as const
 
 export type EngineTable = (typeof ENGINE_TABLES)[number]

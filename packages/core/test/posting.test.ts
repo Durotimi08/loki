@@ -1,13 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import type { AccountInstanceRef, Posting } from '../src/index.js'
-import { isBalanced, sumByDirection } from '../src/index.js'
+import type { AccountInstanceRef, CurrencyCode, Posting } from '../src/index.js'
+import { isBalanced, sumByDirection, sumByDirectionPerCurrency } from '../src/index.js'
 
-const acc = (name: string): AccountInstanceRef => ({
+const acc = (name: string, currency: CurrencyCode = 'NGN'): AccountInstanceRef => ({
   _kind: 'accountInstance',
   actorType: 'Test',
   actorId: 't-1',
   accountName: name,
-  currency: 'NGN',
+  currency,
 })
 
 const D = (a: AccountInstanceRef, amount: bigint): Posting => ({
@@ -49,5 +49,42 @@ describe('postings — isBalanced', () => {
 
   it('is true on an empty list (vacuously balanced)', () => {
     expect(isBalanced([])).toBe(true)
+  })
+
+  it('is false when an FX leg balances in aggregate but not per currency', () => {
+    // 100 USD debited, 100 NGN credited — sum matches, but neither
+    // currency is balanced on its own. Must be flagged.
+    const p: Posting[] = [D(acc('usd_wallet', 'USD'), 100n), C(acc('ngn_wallet', 'NGN'), 100n)]
+    expect(isBalanced(p)).toBe(false)
+  })
+
+  it('is true when each currency balances independently', () => {
+    // Realistic FX: D 100 USD ↔ C 100 USD (to fx_holding); D 8500 NGN
+    // (from fx_holding) ↔ C 8500 NGN. Each currency nets to zero.
+    const userUsd = acc('usd_wallet', 'USD')
+    const fxUsd = acc('fx_holding', 'USD')
+    const fxNgn = acc('fx_holding', 'NGN')
+    const userNgn = acc('ngn_wallet', 'NGN')
+    expect(isBalanced([D(userUsd, 100n), C(fxUsd, 100n), D(fxNgn, 8500n), C(userNgn, 8500n)])).toBe(
+      true,
+    )
+  })
+})
+
+describe('postings — sumByDirectionPerCurrency', () => {
+  it('groups debits and credits by account currency', () => {
+    const p: Posting[] = [
+      D(acc('w', 'USD'), 100n),
+      C(acc('h', 'USD'), 100n),
+      D(acc('h', 'NGN'), 8500n),
+      C(acc('w', 'NGN'), 8500n),
+    ]
+    const sums = sumByDirectionPerCurrency(p)
+    expect(sums.get('USD')).toEqual({ debits: 100n, credits: 100n })
+    expect(sums.get('NGN')).toEqual({ debits: 8500n, credits: 8500n })
+  })
+
+  it('returns an empty map for no postings', () => {
+    expect(sumByDirectionPerCurrency([]).size).toBe(0)
   })
 })

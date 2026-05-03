@@ -3,10 +3,14 @@
 export { buildAdminOps } from './admin.js'
 export type {
   AdminOps,
+  FindViolationsArgs,
+  ProvisionTenantInput,
+  ProvisionTenantResult,
   SchemaAdminOps,
   SchemaVersionCount,
   TenantOps,
   TenantSnapshot,
+  ViolationHit,
 } from './admin.js'
 
 export { isSagaSuccess, runSaga } from './saga.js'
@@ -48,11 +52,55 @@ export type {
   VerifyResult,
 } from './queries.js'
 
-export { openConnection } from './connection.js'
-export type { Connection, ConnectionInput, SqlClient, SqlTransaction } from './connection.js'
+export {
+  NOOP_METRICS,
+  NOOP_TRACER,
+  buildInstruments,
+} from './observability.js'
+export type {
+  Counter,
+  EngineInstruments,
+  Gauge,
+  Histogram,
+  MetricLabels,
+  MetricsAdapter,
+  Span,
+  SpanStatus,
+  Tracer,
+} from './observability.js'
+
+export {
+  DEFAULT_POOL_OPTIONS,
+  compareLsn,
+  openConnection,
+  withSearchPath,
+} from './connection.js'
+
+export { gracefulShutdown, installShutdownHandlers } from './lifecycle.js'
+export type {
+  EngineLike,
+  GracefulShutdownOptions,
+  ShutdownTarget,
+} from './lifecycle.js'
+export type {
+  Connection,
+  ConnectionInput,
+  ReadYourWritesMode,
+  RuntimeRoles,
+  SqlClient,
+  SqlTransaction,
+} from './connection.js'
 
 export { createEngine } from './engine.js'
-export type { AdaptersOps, Engine, EngineOptions } from './engine.js'
+export type {
+  AdaptersOps,
+  DatabaseHealth,
+  Engine,
+  EngineOptions,
+  HealthCheckOptions,
+  HealthReport,
+  ReplicaHealth,
+} from './engine.js'
 
 export {
   ActorNotPermittedError,
@@ -60,7 +108,9 @@ export {
   ConcurrencyConflictError,
   DatabaseError,
   IllegalStateTransitionError,
+  InvalidPostingError,
   KeyAlreadyConsumedError,
+  OverdraftError,
   LokiError,
   MigrationMismatchError,
   RejectTransition,
@@ -71,7 +121,12 @@ export {
 export { computePostingsChecksum, computeRowHash, sha256Hasher } from './hash.js'
 export type { Hasher } from './hash.js'
 
-export { createHookRegistry, matches as matchesHookFilter } from './hooks.js'
+export {
+  BeforeTransitionTimeoutError,
+  createHookRegistry,
+  matches as matchesHookFilter,
+} from './hooks.js'
+export type { HookRegistryOptions } from './hooks.js'
 export type {
   AfterTransitionEvent,
   AnomalyCheckName,
@@ -110,15 +165,66 @@ export type {
   AdapterTransitionAction,
 } from './adapter.js'
 
-export { createReconciler } from './reconciler.js'
+export { createReconciler, nextFireMs, RECONCILER_STATE_TABLE } from './reconciler.js'
 export type {
   Reconciler,
   ReconcilerContext,
   ReconcilerHandle,
+  ReconcilerSchedule,
   RunOnceOptions,
   RunOnceResult,
   StartOptions as ReconcilerStartOptions,
 } from './reconciler.js'
+
+export { buildPartitionsOps } from './partitions.js'
+export type {
+  EnsureForOptions,
+  EnsuredPartition,
+  PartitionTable,
+  PartitionsOps,
+} from './partitions.js'
+
+export { buildFxOps } from './fx.js'
+export type {
+  FxOps,
+  FxRate,
+  FxRateHistoryInput,
+  LookupFxRateInput,
+  PublishFxRateInput,
+} from './fx.js'
+
+export { buildHoldsOps } from './holds.js'
+export type {
+  ExpireHoldsResult,
+  Hold,
+  HoldStatus,
+  HoldsOps,
+  PlaceHoldInput,
+  ReleaseHoldInput,
+} from './holds.js'
+
+export { buildDisputesOps } from './disputes.js'
+export type {
+  Dispute,
+  DisputeStatus,
+  DisputesOps,
+  ExpireDisputesResult,
+  OpenDisputeInput,
+  ResolveDisputeInput,
+} from './disputes.js'
+
+export { buildScheduler } from './scheduler.js'
+export type {
+  CreateScheduledTransitionInput,
+  ListScheduledFilter,
+  RunDueOptions,
+  RunDueResult,
+  Scheduler,
+  ScheduledTransition,
+  ScheduledTransitionStatus,
+  SchedulerWorkerHandle,
+  SchedulerWorkerOptions,
+} from './scheduler.js'
 
 export { createMigrator, MIGRATIONS_TABLE } from './migrator.js'
 export type { AppliedMigration, Migrator, MigratorStatus } from './migrator.js'

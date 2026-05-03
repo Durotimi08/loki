@@ -35,6 +35,7 @@ export type {
   EngineTable,
   MigrationOptions,
   MigrationPlan,
+  PartitioningStrategy,
   ResolvedMigrationOptions,
   TenancyMode,
 } from './types.js'

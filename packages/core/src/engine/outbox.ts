@@ -1,5 +1,8 @@
+import { type PayloadCrypto, decryptPayload } from '../primitives/payload-crypto.js'
 import type { Connection, SqlTransaction } from './connection.js'
 import type { HookRegistry, OutboxFailureTerminalEvent } from './hooks.js'
+import type { EngineInstruments } from './observability.js'
+import { buildInstruments } from './observability.js'
 
 /**
  * Outbox worker (§6.4). Claims a batch with `FOR UPDATE SKIP LOCKED`
@@ -49,6 +52,15 @@ export type OutboxWorkerOptions = {
   readonly backoff?: (nextAttempt: number) => number
   readonly intervalMs?: number
   readonly onError?: (e: unknown) => void
+  /**
+   * Lease TTL (ms) for an in-flight claim. Phase 1 atomically bumps
+   * `next_attempt_at` forward by this much so peers skip in-flight
+   * rows; if the dispatching worker crashes between commit and the
+   * post-dispatch update, the row becomes re-claimable after the TTL
+   * expires. Default 300_000 (5 minutes) — should comfortably exceed
+   * worst-case PSP latency.
+   */
+  readonly claimTtlMs?: number
 }
 
 export type OutboxWorkerHandle = {
@@ -82,6 +94,7 @@ export type OutboxOps = {
 const DEFAULT_BATCH_SIZE = 100
 const DEFAULT_MAX_ATTEMPTS = 5
 const DEFAULT_INTERVAL_MS = 1_000
+const DEFAULT_CLAIM_TTL_MS = 300_000 // 5 minutes
 
 /**
  * Default backoff: capped exponential with full jitter. attempt 1 → ~1s,
@@ -100,10 +113,19 @@ export type BuildOutboxOptions = {
    * engine can capture the adapter list at startup time.
    */
   readonly buildDispatch: (handler: OutboxHandler | undefined) => OutboxDispatch
+  /**
+   * Optional payload-crypto hook (M6). When set, every outbox row's
+   * `payload` envelope is decrypted before the consumer's
+   * `dispatch(event)` sees it — handlers always receive plaintext.
+   */
+  readonly payloadCrypto?: PayloadCrypto
+  /** Observability instruments (Batch H). Defaults to no-op shims. */
+  readonly instruments?: EngineInstruments
 }
 
 export function buildOutboxOps(opts: BuildOutboxOptions): OutboxOps {
-  const { connection, hooks, buildDispatch } = opts
+  const { connection, hooks, buildDispatch, payloadCrypto } = opts
+  const instruments = opts.instruments ?? buildInstruments()
   return {
     startWorker(options = {}) {
       let stopped = false
@@ -114,7 +136,7 @@ export function buildOutboxOps(opts: BuildOutboxOptions): OutboxOps {
       const tick = async (): Promise<void> => {
         if (stopped) return
         try {
-          inFlight = drainBatch(connection, hooks, dispatch, options)
+          inFlight = drainBatch(connection, hooks, dispatch, options, payloadCrypto, instruments)
           await inFlight
         } catch (e) {
           if (options.onError) options.onError(e)
@@ -134,14 +156,14 @@ export function buildOutboxOps(opts: BuildOutboxOptions): OutboxOps {
           await inFlight
         },
         async drainOnce() {
-          return drainBatch(connection, hooks, dispatch, options)
+          return drainBatch(connection, hooks, dispatch, options, payloadCrypto, instruments)
         },
       }
     },
 
     async drainOnce(options = {}) {
       const dispatch = buildDispatch(options.handler)
-      return drainBatch(connection, hooks, dispatch, options)
+      return drainBatch(connection, hooks, dispatch, options, payloadCrypto, instruments)
     },
   }
 }
@@ -150,26 +172,48 @@ async function drainBatch(
   connection: Connection,
   hooks: HookRegistry,
   dispatch: OutboxDispatch,
-  options: Pick<OutboxWorkerOptions, 'batchSize' | 'maxAttempts' | 'backoff'>,
+  options: Pick<OutboxWorkerOptions, 'batchSize' | 'maxAttempts' | 'backoff' | 'claimTtlMs'>,
+  payloadCrypto: PayloadCrypto | undefined,
+  instruments: EngineInstruments,
 ): Promise<number> {
   const batchSize = options.batchSize ?? DEFAULT_BATCH_SIZE
   const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS
   const backoff = options.backoff ?? defaultBackoff
+  const claimTtlMs = options.claimTtlMs ?? DEFAULT_CLAIM_TTL_MS
 
-  // Phase 1: claim a batch under FOR UPDATE SKIP LOCKED. We only hold
-  // the row lock while reading; the handler runs *outside* the lock so
-  // a slow handler doesn't block other workers from making progress
-  // on the next batch.
+  // Phase 1: atomically claim AND lease. The CTE picks rows under
+  // FOR UPDATE SKIP LOCKED; the outer UPDATE bumps `next_attempt_at`
+  // forward by `claimTtlMs` and commits. After this commit:
+  //   - Peer workers see `next_attempt_at > now()` and skip the row.
+  //   - If THIS worker crashes before recording the result, the row
+  //     becomes re-claimable after the TTL expires.
+  // Without the lease bump, a crashed worker that already triggered
+  // a PSP call would let a peer re-claim and double-deliver — see
+  // §6.4 + project-md note about consumer-supplied generic handlers.
   const claimed = await connection.asAdmin(async (tx) => {
     const rows = await tx<Record<string, unknown>[]>`
-      select * from "outbox"
-      where delivered_at is null and failed_at is null
-        and next_attempt_at <= now()
-      order by id
-      for update skip locked
-      limit ${batchSize}
+      with claimed as (
+        select id from "outbox"
+        where delivered_at is null and failed_at is null
+          and next_attempt_at <= now()
+        order by id
+        for update skip locked
+        limit ${batchSize}
+      )
+      update "outbox"
+      set next_attempt_at = now() + (interval '1 millisecond' * ${claimTtlMs})
+      from claimed
+      where "outbox".id = claimed.id
+      returning "outbox".*
     `
-    return rows.map(mapEvent)
+    const mapped = rows.map(mapEvent)
+    if (!payloadCrypto) return mapped
+    const out: OutboxEvent[] = []
+    for (const ev of mapped) {
+      const decrypted = await decryptPayload(payloadCrypto, ev.payload)
+      out.push({ ...ev, payload: (decrypted as Record<string, unknown>) ?? {} })
+    }
+    return out
   })
 
   // Phase 2: dispatch each event, then a third phase records success / failure.
@@ -183,6 +227,7 @@ async function drainBatch(
           where id = ${ev.id}
         `
       })
+      instruments.outboxSuccess.inc(1, { event: ev.event ?? 'unknown' })
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e)
       const nextAttempt = ev.attempts + 1
@@ -223,6 +268,10 @@ async function drainBatch(
         }
         await hooks.internals.fireOutboxFailureTerminal(evt)
       }
+      instruments.outboxFailure.inc(1, {
+        event: ev.event ?? 'unknown',
+        terminal: terminal ? 'true' : 'false',
+      })
     }
   }
 

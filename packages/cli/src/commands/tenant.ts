@@ -9,6 +9,7 @@ export type TenantAction =
   | { readonly kind: 'suspend'; readonly id: string }
   | { readonly kind: 'activate'; readonly id: string }
   | { readonly kind: 'delete'; readonly id: string }
+  | { readonly kind: 'dashboard'; readonly id: string }
 
 export async function runTenant(config: LokiConfig, action: TenantAction, io: Io): Promise<number> {
   const engine = createEngine({
@@ -57,6 +58,52 @@ export async function runTenant(config: LokiConfig, action: TenantAction, io: Io
       case 'delete': {
         const tenant = await engine.admin.tenants.delete(action.id)
         io.out(`Deleted ${tenant.id}.`)
+        return 0
+      }
+      case 'dashboard': {
+        const tenant = await engine.admin.tenants.get(action.id)
+        if (!tenant) {
+          io.err(`No tenant with id "${action.id}".`)
+          return 1
+        }
+        // Roll up the tenant's high-level state in one place. Cheap
+        // queries: each is index-covered. We deliberately do NOT call
+        // reconciler here — operators can run `loki reconcile` if they
+        // want a fresh integrity sweep.
+        const c = engine.forTenant(action.id)
+        const [recordCount] = await engine.connection.sql<{ count: string }[]>`
+          select count(*)::text as count from "txn_records" where tenant_id = ${action.id}
+        `
+        const [transitionCount] = await engine.connection.sql<{ count: string }[]>`
+          select count(*)::text as count from "txn_transitions" where tenant_id = ${action.id}
+        `
+        const [accountCount] = await engine.connection.sql<{ count: string }[]>`
+          select count(*)::text as count from "accounts" where tenant_id = ${action.id}
+        `
+        const openAnomalies = await c.queries.anomalies.findMany({
+          where: { resolved: false },
+          limit: 1000,
+        })
+        const compromised = await engine.connection.sql<{ count: string }[]>`
+          select count(*)::text as count from "txn_records"
+          where tenant_id = ${action.id} and compromised = true
+        `
+        const versions = await engine.admin.schema.versions(action.id)
+
+        io.out(`Tenant: ${tenant.id} (${tenant.name})`)
+        io.out(`  Mode:               ${tenant.mode}`)
+        io.out(`  State:              ${tenant.state}`)
+        io.out(`  Records:            ${recordCount?.count ?? '0'}`)
+        io.out(`  Transitions:        ${transitionCount?.count ?? '0'}`)
+        io.out(`  Accounts:           ${accountCount?.count ?? '0'}`)
+        io.out(`  Compromised:        ${compromised[0]?.count ?? '0'}`)
+        io.out(`  Open anomalies:     ${openAnomalies.items.length}`)
+        if (versions.length > 0) {
+          io.out('  Schema versions:')
+          for (const v of versions) {
+            io.out(`    v${v.version}: ${v.records} records, ${v.transitions} transitions`)
+          }
+        }
         return 0
       }
     }

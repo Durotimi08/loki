@@ -44,7 +44,7 @@ export function planInitialMigration(
     ...buildDropRolesSql(resolved),
     ...buildDropRlsSql(resolved),
     ...buildDropIndexesSql(resolved),
-    ...buildDropTablesSql(resolved),
+    ...buildDropTablesSql(resolved, schema),
   ]
 
   const sep = '\n'

@@ -699,6 +699,45 @@ const engine = createEngine({ schema, connection, metrics, tracer })
 
 The pre-built instruments (`engine.instruments.*`) cover every transition (duration histogram, error counter), every reconciler pass (duration, anomalies-by-severity), every outbox dispatch (success/failure counters), and every scheduler fire.
 
+### Logging (operational events)
+
+The engine emits structured records — engine started, migration applied, reconciliation pass finished, outbox dispatch failed terminally — through a `Logger` plug-in following the same shape as `metrics` and `tracer`. The interface is a deliberate subset of pino / winston / bunyan so adapting any of them is a one-line wrapper. Without a logger, the engine is silent.
+
+```ts
+import { createEngine, consoleLogger } from '@loki/core'
+
+// Development: JSON-per-line on stdout/stderr.
+const engine = createEngine({
+  schema,
+  connection,
+  logger: consoleLogger({ level: 'info' }),
+})
+
+// Production: bring your own.
+import pino from 'pino'
+const log = pino()
+const engine = createEngine({
+  schema,
+  connection,
+  logger: {
+    debug: (m, f) => log.debug(f, m),
+    info:  (m, f) => log.info(f, m),
+    warn:  (m, f) => log.warn(f, m),
+    error: (m, f) => log.error(f instanceof Error ? { err: f } : f, m),
+    child: (f) => /* wrap pino.child(f) the same way */ /* … */ engine.instruments.logger,
+  },
+})
+```
+
+**Why a plug-in and not a `log.txt` file:** containerised deployments treat the filesystem as ephemeral — a file in the app disappears when the pod restarts, races under concurrent writers, and doesn't help you when there are 100 replicas. The right pattern is:
+
+1. App emits structured logs to stdout (one JSON object per line — `consoleLogger()` does this).
+2. The container runtime (k8s, systemd, ECS) captures stdout.
+3. A log shipper (Fluent Bit, Vector, Datadog Agent) ships records to your aggregator.
+4. The aggregator (Datadog, Splunk, CloudWatch, Grafana Loki, ELK) handles **retention** (e.g. 30 days hot, 1 year warm), **search**, **alerts**, and **dashboards**.
+
+Don't summarise inside the app — summarisation is a query you run in the aggregator. If you need a single-node tail-able log, pipe stdout: `node app.js | tee log.txt | rotatelogs …`. The engine stays out of the file business.
+
 ### Schema evolution
 
 Append-only history means schema changes don't rewrite old rows. Every record + transition carries its `schema_version`.

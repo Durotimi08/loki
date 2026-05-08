@@ -53,15 +53,20 @@ export type {
 } from './queries.js'
 
 export {
+  NOOP_LOGGER,
   NOOP_METRICS,
   NOOP_TRACER,
   buildInstruments,
+  consoleLogger,
 } from './observability.js'
 export type {
   Counter,
   EngineInstruments,
   Gauge,
   Histogram,
+  LogFields,
+  LogLevel,
+  Logger,
   MetricLabels,
   MetricsAdapter,
   Span,

@@ -267,6 +267,26 @@ async function drainBatch(
           lastError: message,
         }
         await hooks.internals.fireOutboxFailureTerminal(evt)
+        instruments.logger.error('outbox dispatch failed terminally', {
+          outboxId: ev.id,
+          tenantId: ev.tenantId,
+          event: ev.event ?? null,
+          intent: ev.intent ?? null,
+          attempts: nextAttempt,
+          lastError: message,
+        })
+      } else {
+        // Transient failure — log at warn so operators can spot a
+        // bad PSP or a flaky webhook without it being lost in info
+        // chatter, but don't escalate to error (the retry will
+        // probably succeed).
+        instruments.logger.warn('outbox dispatch transient failure', {
+          outboxId: ev.id,
+          tenantId: ev.tenantId,
+          event: ev.event ?? null,
+          attempt: nextAttempt,
+          error: message,
+        })
       }
       instruments.outboxFailure.inc(1, {
         event: ev.event ?? 'unknown',

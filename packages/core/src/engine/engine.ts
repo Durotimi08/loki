@@ -20,6 +20,7 @@ import { type HookRegistry, createHookRegistry } from './hooks.js'
 import { type Migrator, createMigrator } from './migrator.js'
 import {
   type EngineInstruments,
+  type Logger,
   type MetricsAdapter,
   type Tracer,
   buildInstruments,
@@ -123,6 +124,23 @@ export type EngineOptions = {
    * `Tracer.startSpan`. Without one, the engine uses a no-op tracer.
    */
   readonly tracer?: Tracer
+  /**
+   * Optional structured logger for the engine's OWN operational
+   * events — engine started, migration applied, outbox worker
+   * stopped, connection error. Without one, the engine is silent
+   * (NOOP_LOGGER) so existing tests don't suddenly start writing to
+   * stdout.
+   *
+   * The shape is a deliberate subset of pino / winston / bunyan, so
+   * adapting any of them is a one-line wrapper. For development, see
+   * `consoleLogger()` — JSON-per-line on stdout/stderr.
+   *
+   * Production wiring: emit JSON to stdout, let your container
+   * runtime + log shipper carry it to your aggregator. Don't log to
+   * a file inside the application — the filesystem is ephemeral and
+   * retention belongs at the aggregator.
+   */
+  readonly logger?: Logger
 }
 
 export type AdaptersOps = {
@@ -271,7 +289,12 @@ export function createEngine(options: EngineOptions): Engine {
   const connection = openConnection(connectionInput)
   // Batch H: pre-resolve the instrument set once. No-op shims kick in
   // when neither `metrics` nor `tracer` is configured.
-  const instruments = buildInstruments(options.metrics, options.tracer)
+  const instruments = buildInstruments(options.metrics, options.tracer, options.logger)
+  instruments.logger.info('engine constructed', {
+    schemaVersion: options.schema.version,
+    readYourWrites: options.readYourWrites ?? 'off',
+    payloadCrypto: options.payloadCrypto !== undefined,
+  })
   const hasher = options.hasher ?? sha256Hasher
   const hooks = createHookRegistry({
     ...(options.hooks?.beforeTransitionTimeoutMs !== undefined
@@ -418,12 +441,30 @@ export function createEngine(options: EngineOptions): Engine {
       })
     },
     async migrate() {
-      return migrator.apply(migrations)
+      const startTime = Date.now()
+      try {
+        const applied = await migrator.apply(migrations)
+        instruments.logger.info('migrations applied', {
+          count: applied.length,
+          ids: applied.map((m) => m.id).join(','),
+          durationMs: Date.now() - startTime,
+        })
+        return applied
+      } catch (e) {
+        instruments.logger.error('migration apply failed', e instanceof Error ? e : undefined)
+        throw e
+      }
     },
     async rollback() {
       const last = migrations[migrations.length - 1]
       if (!last) return
-      await migrator.rollback(last)
+      try {
+        await migrator.rollback(last)
+        instruments.logger.info('migration rolled back', { id: last.id })
+      } catch (e) {
+        instruments.logger.error('migration rollback failed', e instanceof Error ? e : undefined)
+        throw e
+      }
     },
     migrations,
     migrator,
@@ -435,6 +476,7 @@ export function createEngine(options: EngineOptions): Engine {
       return runHealthCheck(connection, migrations, opts)
     },
     async close() {
+      instruments.logger.info('engine closing')
       await connection.close()
     },
   }

@@ -1008,9 +1008,39 @@ type Span = {
   recordException(error: unknown): void
   end(): void
 }
+
+type LogLevel = 'debug' | 'info' | 'warn' | 'error'
+
+type LogFields = Readonly<Record<string, string | number | boolean | null | undefined>>
+
+type Logger = {
+  debug(message: string, fields?: LogFields): void
+  info(message: string, fields?: LogFields): void
+  warn(message: string, fields?: LogFields): void
+  error(message: string, fieldsOrError?: LogFields | Error, error?: Error): void
+  child(fields: LogFields): Logger
+}
 ```
 
-The shapes match Prometheus (counter / histogram / gauge) and OpenTelemetry (`Tracer.startSpan`). Without a config, the engine uses no-op shims (`NOOP_METRICS`, `NOOP_TRACER`) so call sites compile to nothing.
+The metric/tracer shapes match Prometheus (counter / histogram / gauge) and OpenTelemetry (`Tracer.startSpan`). The logger shape is a deliberate subset of pino / winston / bunyan so adapting any of them is a one-line wrapper. Without a config, the engine uses no-op shims (`NOOP_METRICS`, `NOOP_TRACER`, `NOOP_LOGGER`) so call sites compile to nothing.
+
+**`consoleLogger(opts?)`** — convenience JSON-per-line logger for development. Records on stdout, error/warn on stderr. Default level `'info'`; pass `{ level: 'debug' }` for full chatter.
+
+**Engine operational events emitted via the logger:**
+
+| level | message | when |
+|---|---|---|
+| info | `engine constructed` | `createEngine` returns |
+| info | `engine closing` | `engine.close()` enters |
+| info | `migrations applied` | `engine.migrate()` succeeds (with `count`, `durationMs`) |
+| error | `migration apply failed` | `engine.migrate()` throws |
+| info | `migration rolled back` | `engine.rollback()` succeeds |
+| error | `migration rollback failed` | `engine.rollback()` throws |
+| debug | `reconciliation pass clean` | `runOnce` finishes with zero anomalies |
+| info | `reconciliation pass found anomalies` | non-critical anomalies present |
+| warn | `reconciliation pass finished with critical anomalies` | hash-chain breaks etc. |
+| warn | `outbox dispatch transient failure` | a dispatch threw but the row will retry |
+| error | `outbox dispatch failed terminally` | dispatch hit `maxAttempts` |
 
 **Pre-built instruments** (`engine.instruments.*`):
 

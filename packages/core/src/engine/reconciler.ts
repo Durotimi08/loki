@@ -409,11 +409,31 @@ export function createReconciler(ctx: ReconcilerContext): Reconciler {
       // ops dashboards keep their meaning.
       const everyWatermarkWasNull = checkKeys.every((k) => watermarks[k] === null)
       // Batch H: emit duration + per-severity anomaly counters.
-      instruments.reconcilerDurationMs.observe(Date.now() - startTime, {
+      const durationMs = Date.now() - startTime
+      instruments.reconcilerDurationMs.observe(durationMs, {
         full_sweep: fullSweep || everyWatermarkWasNull ? 'true' : 'false',
       })
       for (const a of anomalies) {
         instruments.reconcilerAnomalies.inc(1, { check: a.check, severity: a.severity })
+      }
+      // Operational log: one record per pass. Quiet on a clean pass
+      // (info), louder when anomalies land. Critical anomalies also
+      // surface through `onIntegrityViolation` for paging.
+      const logFields = {
+        durationMs,
+        anomalies: anomalies.length,
+        quarantined: result.quarantined.length,
+        repaired: result.repaired.length,
+        expiredKeys: result.expiredKeys,
+        fullSweep: fullSweep || everyWatermarkWasNull,
+        ...(options.tenantId !== undefined ? { tenantId: options.tenantId } : {}),
+      }
+      if (anomalies.some((a) => a.severity === 'critical')) {
+        instruments.logger.warn('reconciliation pass finished with critical anomalies', logFields)
+      } else if (anomalies.length > 0) {
+        instruments.logger.info('reconciliation pass found anomalies', logFields)
+      } else {
+        instruments.logger.debug('reconciliation pass clean', logFields)
       }
       await ctx.hooks.internals.fireReconciliationComplete({
         startedAt,

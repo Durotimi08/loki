@@ -98,27 +98,37 @@ type ActorInput = {
 type AccountOptions = {
   currency: CurrencyCode    // 'NGN' | 'USD' | 'EUR' | …
   shards?: number           // hot-account sharding (default 1)
-  allowOverdraft?: boolean  // M1: refuse negative balance when false (default true)
+  allowOverdraft?: boolean  // M1: refuse negative balance when false. Default `false`.
   parent?: string           // sub-accounts
 }
 ```
 
 ```ts
 const User = defineActor('User', {
-  accounts: {
-    wallet: { currency: 'NGN', allowOverdraft: false }, // M1
-  },
+  // Default `allowOverdraft: false` — the safe posture for a money-
+  // movement library. Wallet must be funded before the first debit.
+  accounts: { wallet: { currency: 'NGN' } },
 })
 const Company = defineActor('Company', {
   accounts: {
-    revenue: { currency: 'NGN', shards: 16 }, // hot-account sharding
+    // Sharded accounts can't enforce overdraft (the cross-shard
+    // balance check would race with single-shard writers). Operators
+    // explicitly opt in.
+    revenue: { currency: 'NGN', shards: 16, allowOverdraft: true },
     promo_pool: { currency: 'NGN' },
   },
+})
+const Funder = defineActor('Funder', {
+  // Liability account that funds user wallets via top-ups. Runs
+  // negative — opt in to overdraft.
+  accounts: { source: { currency: 'NGN', allowOverdraft: true } },
 })
 const System = defineActor('System') // no accounts
 ```
 
-**Overdraft policy (M1).** When `allowOverdraft: false`, the engine refuses any transition that would take the account's net balance below zero. Per-account net delta is summed across all postings on that account first, then a guarded `UPDATE` runs (`set balance = balance + delta WHERE balance + delta >= 0`). On 0 rows updated, the engine throws `OverdraftError` and the tx rolls back — balance is unchanged. Reversal transitions (`postings: 'invert:...'`) bypass the check; the whole point of a reversal is to refund. `allowOverdraft: false` cannot combine with `shards > 1` (the constraint on the sum-across-shards races with concurrent single-shard writes); `defineActor` throws at schema-build time.
+**Overdraft policy.** Default `allowOverdraft: false`. The engine refuses any transition that would take an account's net balance below zero. Per-account net delta is summed across all postings on that account first, then a guarded `UPDATE` runs (`set balance = balance + delta WHERE balance + delta >= 0`). On 0 rows updated, the engine throws `OverdraftError` and the tx rolls back — balance is unchanged.
+
+Operators opt INTO overdraft (`allowOverdraft: true`) for accounts that legitimately track liability or imbalance: external-funding sources, FX clearing legs, sharded credit-accumulating accounts. Reversal transitions (`postings: 'invert:...'`) bypass the check regardless — the whole point of a reversal is to refund. `allowOverdraft: false` cannot combine with `shards > 1` (the constraint on the sum-across-shards races with concurrent single-shard writers); `defineActor` throws at schema-build time.
 
 ### `defineTransaction`
 

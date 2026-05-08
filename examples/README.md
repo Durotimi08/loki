@@ -27,7 +27,7 @@ These are **starters** for adopting Loki — not full applications. Each:
 - ✅ Defines a complete schema, runs migrations, drives the happy path.
 - ✅ Shows the typed runtime API you'd hit from a request handler.
 - ✅ Wires the reconciler + outbox worker + graceful shutdown.
-- ❌ Does NOT include the HTTP layer, request auth, or front-end. That's your call — Loki is a transaction layer, not a framework.
+- ❌ Does NOT include the HTTP layer, request auth, or front-end.
 - ❌ Does NOT include real PSP credentials. The Stripe example uses `@loki/adapter-mocked` for everything an HTTP boundary would do.
 
 If you find a workflow that's not represented here and is broadly useful, open an issue with the schema sketch.

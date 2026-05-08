@@ -2,7 +2,7 @@
 
 Recurring billing with proration on upgrade, idempotent retries on PSP failure, and scheduled cancellations.
 
-> **Status:** schema sketched; the implementation lives in `src/`. This README is the authoritative tour — the code is straight TypeScript, no HTTP or frontend.
+> **Status:** schema sketched; the implementation lives in `src/`. Straight TypeScript, no HTTP or frontend.
 
 ## Schema sketch
 

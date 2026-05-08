@@ -2,7 +2,7 @@
 
 Two-sided marketplace: a user pays for a delivery, the driver gets paid, the company keeps a fee. The user can refund within a window — the engine mints a one-shot capability key on `pay` that's required to drive `refund`.
 
-This is the `§15.1` example from `project.md` reduced to its smallest runnable form. It's the right starter to read first.
+The `§15.1` example from `project.md` reduced to its smallest runnable form.
 
 ## What it shows
 
@@ -16,7 +16,7 @@ This is the `§15.1` example from `project.md` reduced to its smallest runnable 
 
 ## What it deliberately doesn't show
 
-- HTTP layer / request auth / front-end. That's your call — Loki is a transaction layer.
+- HTTP layer / request auth / front-end.
 - Real PSP integration (Stripe, Paystack, etc). See `../escrow-with-stripe/` for an adapter-driven example.
 - Multi-currency, FX, holds, disputes. See the corresponding sections in the project root README.
 

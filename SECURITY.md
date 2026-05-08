@@ -1,6 +1,6 @@
 # Security & data-handling guidance
 
-Loki is a money-movement library. Several regulatory frameworks (PCI DSS for cardholder data, GDPR for EU personal data, regional finance regulators for payout flows) impose constraints that interact awkwardly with an append-only audit log. This document is the authoritative guidance — read it before storing anything sensitive.
+Read this before storing anything sensitive in Loki. PCI DSS, GDPR, and regional finance rules interact awkwardly with an append-only audit log; the patterns below cover the common cases.
 
 ## TL;DR
 
@@ -56,7 +56,7 @@ Append-only history is fundamentally at odds with "delete all my data on request
 
 ### Pattern A — separate the personal data
 
-The cleanest approach. Loki holds a stable opaque identifier (your customer's internal id), and the personal-data-bearing fields (name, email, address) live in a separate `customers` table outside Loki.
+Loki holds a stable opaque identifier (your customer's internal id); personal-data fields (name, email, address) live in a separate `customers` table outside Loki.
 
 - **Erasure.** DELETE / anonymize the row in `customers`. Loki's records still reference the opaque id — they're now references to "deleted customer 12345" rather than to "Jane Doe."
 - **Cost.** Higher boundary discipline — consumer code has to JOIN to `customers` to render a name.
@@ -106,5 +106,3 @@ The reconciler runs as `loki_admin` (no tenant GUC), so cross-tenant integrity s
 - `DATABASE_URL` belongs in your secret manager, not your env file in source control.
 - `payloadCrypto` and HMAC keys (`@loki/hmac` / `signOutboxPayload`) belong in a KMS, not the runtime env. Pass them at boot via your secret manager → in-memory delivery, never written to disk.
 - Loki itself never logs the connection string or payload contents at any level. If you wrap the engine in custom logging, **explicitly redact** payloads — your hooks see plaintext.
-
-The package is small and the threat model is clear; we don't expect a long backlog.

@@ -280,4 +280,175 @@ describe('batch D — fx_rate_drift reconciler check', () => {
     })
     expect(result.anomalies.some((a) => a.check === 'fx_rate_drift')).toBe(false)
   })
+
+  it('verifies old transitions against the rate that was in effect when they fired', async () => {
+    if (!engine) return
+    // Publish R1 first, then drive a transition pinned at R1, then
+    // publish R2 (a different rate) "later". The reconciler must
+    // verify the old transition against R1 (in effect at its
+    // occurred_at), not R2 (the latest rate). This is the user's
+    // exact concern: "if I set a rate then change it, what about
+    // records that used the old rate?"
+    const earlier = new Date('2026-01-01T00:00:00Z')
+    const later = new Date('2026-06-01T00:00:00Z')
+    await engine.fx.publish({
+      tenantId: TENANT,
+      baseCurrency: 'USD',
+      quoteCurrency: 'NGN',
+      rate: '1500.0',
+      source: 'cbn',
+      fixedAt: earlier,
+    })
+    const c = engine.forTenant(TENANT)
+    const user = { type: 'User', id: 'u-fx-old' }
+    const driver = { type: 'Driver', id: 'd-fx-old' }
+    const company = { type: 'Company', id: 'co-fx' }
+    await c.accounts.create({ actor: user, name: 'wallet' })
+    await c.accounts.create({ actor: driver, name: 'balance' })
+    await c.accounts.create({ actor: company, name: 'revenue' })
+    await engine.connection.sql.unsafe(
+      `update "accounts" set balance = 5000 where owner_actor_type = 'User' and owner_actor_id = 'u-fx-old'`,
+    )
+    const txn = await c.transactions.create({
+      type: 'DeliveryPayment',
+      by: user,
+      participants: { user, driver, company },
+      idempotencyKey: 'fx-old:create',
+    })
+    const r = await c.transactions.transition({
+      id: txn.record.id,
+      name: 'pay',
+      by: user,
+      idempotencyKey: 'fx-old:pay',
+      data: { amount: 1500n, driverShare: 500n, companyShare: 1000n },
+    })
+    // Pin R1 in payload + back-date occurred_at into R1's window so
+    // the reconciler sees this transition as "fired during R1".
+    await engine.connection.sql.unsafe(
+      `update "txn_transitions"
+         set payload = jsonb_set(jsonb_set(jsonb_set(jsonb_set(payload, '{rate}', '"1500.0"', true), '{baseCurrency}', '"USD"', true), '{quoteCurrency}', '"NGN"', true), '{rateSource}', '"cbn"', true),
+             occurred_at = '2026-03-01T00:00:00Z'
+       where id = '${r.transition.id}'`,
+    )
+    // NOW publish R2 — a different rate. If the reconciler naively
+    // picked the latest rate, the old transition would now fail.
+    await engine.fx.publish({
+      tenantId: TENANT,
+      baseCurrency: 'USD',
+      quoteCurrency: 'NGN',
+      rate: '1700.0',
+      source: 'cbn',
+      fixedAt: later,
+    })
+    const result = await engine.reconciler.runOnce({
+      tenantId: TENANT,
+      quarantine: false,
+    })
+    // Old transition pinned at R1, occurred_at in R1's window → no
+    // drift. (We can't use queries.verify here because the raw-SQL
+    // payload tweak broke the hash chain; that's an unrelated
+    // anomaly the reconciler will flag separately.)
+    expect(result.anomalies.some((a) => a.check === 'fx_rate_drift')).toBe(false)
+  })
+
+  it('matches against the same source the transition pinned (not just latest fixed_at)', async () => {
+    if (!engine) return
+    const c = engine.forTenant(TENANT)
+    // Two feeds, same (base, quote), with cbn slightly older than
+    // ecb. A transition pinned to cbn should be compared against
+    // cbn — without source-aware lookup the reconciler would pick
+    // ecb (most recent fixed_at) and report a false drift.
+    const cbnFixed = new Date('2026-04-01T00:00:00Z')
+    const ecbFixed = new Date('2026-04-02T00:00:00Z')
+    await engine.fx.publish({
+      tenantId: TENANT,
+      baseCurrency: 'USD',
+      quoteCurrency: 'NGN',
+      rate: '1500.0',
+      source: 'cbn',
+      fixedAt: cbnFixed,
+    })
+    await engine.fx.publish({
+      tenantId: TENANT,
+      baseCurrency: 'USD',
+      quoteCurrency: 'NGN',
+      rate: '1480.0', // ECB sees a different number
+      source: 'ecb',
+      fixedAt: ecbFixed,
+    })
+    const user = { type: 'User', id: 'u-fx-src' }
+    const driver = { type: 'Driver', id: 'd-fx-src' }
+    const company = { type: 'Company', id: 'co-fx' }
+    await c.accounts.create({ actor: user, name: 'wallet' })
+    await c.accounts.create({ actor: driver, name: 'balance' })
+    await c.accounts.create({ actor: company, name: 'revenue' })
+    await engine.connection.sql.unsafe(
+      `update "accounts" set balance = 5000 where owner_actor_type = 'User' and owner_actor_id = 'u-fx-src'`,
+    )
+    const txn = await c.transactions.create({
+      type: 'DeliveryPayment',
+      by: user,
+      participants: { user, driver, company },
+      idempotencyKey: 'fx-src:create',
+    })
+    const r = await c.transactions.transition({
+      id: txn.record.id,
+      name: 'pay',
+      by: user,
+      idempotencyKey: 'fx-src:pay',
+      data: { amount: 1500n, driverShare: 500n, companyShare: 1000n },
+    })
+    await engine.connection.sql.unsafe(
+      `update "txn_transitions"
+         set payload = jsonb_set(jsonb_set(jsonb_set(jsonb_set(payload, '{rate}', '"1500.0"', true), '{baseCurrency}', '"USD"', true), '{quoteCurrency}', '"NGN"', true), '{rateSource}', '"cbn"', true),
+             occurred_at = '2026-04-15T00:00:00Z'
+       where id = '${r.transition.id}'`,
+    )
+    const result = await engine.reconciler.runOnce({
+      tenantId: TENANT,
+      quarantine: false,
+    })
+    expect(result.anomalies.some((a) => a.check === 'fx_rate_drift')).toBe(false)
+  })
+
+  it('flags a rate-pinned transition with no rate in effect at its occurred_at', async () => {
+    if (!engine) return
+    // Don't publish any rate. Drive a transition that pins a rate
+    // anyway. The reconciler must flag this as drift — silent skip
+    // would let an operational mistake (forgot to publish, gap in
+    // expires_at coverage) slip through unnoticed.
+    const c = engine.forTenant(TENANT)
+    const user = { type: 'User', id: 'u-fx-gap' }
+    const driver = { type: 'Driver', id: 'd-fx-gap' }
+    const company = { type: 'Company', id: 'co-fx' }
+    await c.accounts.create({ actor: user, name: 'wallet' })
+    await c.accounts.create({ actor: driver, name: 'balance' })
+    await c.accounts.create({ actor: company, name: 'revenue' })
+    await engine.connection.sql.unsafe(
+      `update "accounts" set balance = 5000 where owner_actor_type = 'User' and owner_actor_id = 'u-fx-gap'`,
+    )
+    const txn = await c.transactions.create({
+      type: 'DeliveryPayment',
+      by: user,
+      participants: { user, driver, company },
+      idempotencyKey: 'fx-gap:create',
+    })
+    const r = await c.transactions.transition({
+      id: txn.record.id,
+      name: 'pay',
+      by: user,
+      idempotencyKey: 'fx-gap:pay',
+      data: { amount: 1500n, driverShare: 500n, companyShare: 1000n },
+    })
+    await engine.connection.sql.unsafe(
+      `update "txn_transitions" set payload = jsonb_set(jsonb_set(jsonb_set(jsonb_set(payload, '{rate}', '"1500.0"', true), '{baseCurrency}', '"USD"', true), '{quoteCurrency}', '"NGN"', true), '{rateSource}', '"unpub"', true) where id = '${r.transition.id}'`,
+    )
+    const result = await engine.reconciler.runOnce({
+      tenantId: TENANT,
+      quarantine: false,
+    })
+    const drift = result.anomalies.find((a) => a.check === 'fx_rate_drift')
+    expect(drift).toBeDefined()
+    expect((drift?.observed as { status?: string })?.status).toBe('no_rate_in_effect')
+  })
 })

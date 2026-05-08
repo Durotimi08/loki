@@ -90,13 +90,28 @@ A `txn_keys` row's `granted_by_transition_id` references a transition that doesn
 
 ### `fx_rate_drift` (severity: error)
 
-A rate-pinned transition's `data.rate` disagrees with the published `fx_rates` row beyond `fxRateTolerance`.
+A rate-pinned transition's `data.rate` either disagrees with the published `fx_rates` row beyond `fxRateTolerance`, or there's no published rate the verifier can compare against. The reconciler does NOT compare against the *current* rate — it looks up whichever rate had `fixed_at <= transition.occurred_at` (filtered by `data.rateSource` if the transition pinned one). So old transitions pinned at an old rate stay clean even after the rate changes.
 
-**What it means.** The transition was committed with a stale or mis-typed exchange rate.
+**Read `observed.status` to discriminate the two failure modes:**
 
-**First moves.**
-1. Look at the `expected` (published rate) and `observed` (transition's pinned rate) in the anomaly. If the published rate is the right one, the transition's rate is wrong; you may need a corrective transition.
-2. If the transition's rate is right (e.g. you locked an off-table custom rate for a customer), republish the rate to the FX table with the correct fixed_at, OR raise `fxRateTolerance` for this tenant.
+| `observed.status` | what happened |
+|---|---|
+| `undefined` (default) | classic drift — published rate exists but differs from the pinned rate beyond tolerance |
+| `'no_rate_in_effect'` | no published rate matches `(tenant, base, quote, source, fixed_at <= occurred_at, expires_at > occurred_at)` |
+
+**Drift case (the classic).**
+
+1. Look at `expected.rate` (published) vs `observed.rate` (pinned). If the published rate is the right one, the transition's rate is wrong — drive a corrective transition.
+2. If the transition's rate is right (you locked an off-table custom rate for a customer), republish the rate to `fx_rates` with the correct `fixed_at`, OR raise `fxRateTolerance` for this tenant.
+
+**No-rate-in-effect case.**
+
+1. Check the transition's `payload.rateSource` and `occurred_at`. The reconciler is filtering by source — a transition pinned to `cbn` is only compared against `cbn` rows.
+2. Three common causes:
+   - **Operator forgot to publish.** Publish the rate now with the correct `fixed_at` (≤ the transition's `occurred_at`).
+   - **Coverage gap from `expires_at`.** The previous rate's `expires_at` was before the transition's `occurred_at` and the next rate's `fixed_at` was after. Publish a backfill row covering the gap.
+   - **Source typo.** The transition pinned `rateSource: 'cbn'` but the rate was published as `'CBN'` (case mismatch, or trailing whitespace). Strings are matched exactly.
+3. If you don't publish a backfill row, the anomaly stays in `txn_anomalies` until manually resolved — it's not auto-repairable.
 
 ---
 

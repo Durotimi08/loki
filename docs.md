@@ -878,7 +878,22 @@ await engine.fx.publish({
 const rate = await engine.fx.lookup({ tenantId: 'chidori', baseCurrency: 'USD', quoteCurrency: 'NGN' })
 ```
 
-**Reconciler check.** A transition that pins a rate via `data.rate` (decimal string) + `data.baseCurrency` + `data.quoteCurrency` is verified against the published rate within `fxRateTolerance` (default `0.0001`, one basis point). Disagreements emit `fx_rate_drift` (severity `error`, no quarantine).
+**Reconciler check.** A transition that pins a rate via `data.rate` (decimal string) + `data.baseCurrency` + `data.quoteCurrency` is verified against the published rate **that was in effect at the transition's `occurred_at`** — not the current rate. The lookup uses:
+
+- `fixed_at <= transition.occurred_at` (rate must have been published before the transition)
+- `expires_at IS NULL OR expires_at > transition.occurred_at` (rate must not have expired by then)
+- `source = transition.payload.rateSource` (when the transition pinned a specific feed — supports multi-source FX setups)
+
+So old transitions pinned at an old rate keep verifying cleanly even after the rate changes. New rates only affect new transitions; back-publishing with `fixed_at` in the past does retroactively re-verify older transitions, which is what you want when correcting a feed error.
+
+Two `fx_rate_drift` failure modes (discriminated by `observed.status`):
+
+| `observed.status` | what happened |
+|---|---|
+| absent | published rate exists but differs from the pinned rate beyond `fxRateTolerance` (default `0.0001`) |
+| `'no_rate_in_effect'` | no published rate matches the (base, quote, source) tuple at the transition's `occurred_at` — operator forgot to publish, `expires_at` coverage gap, or source typo |
+
+Severity `error`; no quarantine — `fx_rate_drift` is a billing dispute, not an integrity break.
 
 ```ts
 await engine.reconciler.runOnce({ tenantId: 'chidori', fxRateTolerance: 0.001 })

@@ -972,6 +972,14 @@ async function checkFxRateDrift(
     }
     const declared = Number(declaredRate)
     if (!Number.isFinite(declared) || declared <= 0) continue
+    // Source-aware lookup: when the transition pinned a specific feed
+    // via `rateSource`, only compare against rows from that feed.
+    // Without this, a multi-source FX setup yields false drifts —
+    // the latest `fixed_at` across sources wins even if the
+    // transition pinned a different source.
+    const declaredSource = payload['rateSource']
+    const sourceFilter = typeof declaredSource === 'string' ? declaredSource : null
+    const sourceFrag = sourceFilter ? tx`and source = ${sourceFilter}` : tx``
     const [pub] = await tx<{ rate: string; source: string }[]>`
       select rate::text as rate, source from "fx_rates"
       where tenant_id = ${t.tenant_id}
@@ -979,10 +987,43 @@ async function checkFxRateDrift(
         and quote_currency = ${quoteCurrency}
         and fixed_at <= ${t.occurred_at}
         and (expires_at is null or expires_at > ${t.occurred_at})
+        ${sourceFrag}
       order by fixed_at desc
       limit 1
     `
-    if (!pub) continue
+    if (!pub) {
+      // No published rate was in effect at this transition's
+      // `occurred_at` for the (base, quote, source) tuple. Two
+      // operational causes:
+      //   1. Operator forgot to publish (or expired) a rate.
+      //   2. Operator published the rate with a `fixed_at` after
+      //      the transition fired (clock skew or out-of-order
+      //      bookkeeping).
+      // In either case the transition's pin is unverifiable; the
+      // reconciler is the right place to surface that — silent
+      // skip would let an operational gap go undetected.
+      drafts.push({
+        tenantId: t.tenant_id,
+        check: 'fx_rate_drift',
+        txnId: t.txn_id,
+        txnType: t.type,
+        expected: {
+          baseCurrency,
+          quoteCurrency,
+          ...(sourceFilter ? { source: sourceFilter } : {}),
+          status: 'rate_published',
+        },
+        observed: {
+          rate: declaredRate,
+          source: declaredSource ?? null,
+          baseCurrency,
+          quoteCurrency,
+          status: 'no_rate_in_effect',
+        },
+        context: { transitionId: t.id, occurredAt: t.occurred_at, reason: 'gap_or_unpublished' },
+      })
+      continue
+    }
     const published = Number(pub.rate)
     if (!Number.isFinite(published) || published <= 0) continue
     const drift = Math.abs(declared - published) / published
@@ -995,7 +1036,7 @@ async function checkFxRateDrift(
         expected: { rate: pub.rate, source: pub.source, baseCurrency, quoteCurrency },
         observed: {
           rate: declaredRate,
-          source: payload['rateSource'] ?? null,
+          source: declaredSource ?? null,
           baseCurrency,
           quoteCurrency,
         },

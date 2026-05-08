@@ -92,6 +92,7 @@ export function buildFxOps(connection: Connection): FxOps {
     async publish(input) {
       assertCurrency(input.baseCurrency, 'baseCurrency')
       assertCurrency(input.quoteCurrency, 'quoteCurrency')
+      assertDistinctPair(input.baseCurrency, input.quoteCurrency)
       assertRate(input.rate)
       const fixedAt = input.fixedAt ?? new Date()
       const expiresAt = input.expiresAt ?? null
@@ -114,6 +115,7 @@ export function buildFxOps(connection: Connection): FxOps {
     async lookup(input) {
       assertCurrency(input.baseCurrency, 'baseCurrency')
       assertCurrency(input.quoteCurrency, 'quoteCurrency')
+      assertDistinctPair(input.baseCurrency, input.quoteCurrency)
       const at = input.at ?? new Date()
       return connection.asAdmin(async (tx) => {
         const [row] = await tx<Record<string, unknown>[]>`
@@ -135,6 +137,7 @@ export function buildFxOps(connection: Connection): FxOps {
     async history(input) {
       assertCurrency(input.baseCurrency, 'baseCurrency')
       assertCurrency(input.quoteCurrency, 'quoteCurrency')
+      assertDistinctPair(input.baseCurrency, input.quoteCurrency)
       const limit = Math.min(1000, Math.max(1, input.limit ?? 100))
       const since = input.since ?? null
       const until = input.until ?? null
@@ -178,6 +181,14 @@ function assertCurrency(value: string, label: string): void {
   if (!CURRENCY_REGEX.test(value)) {
     throw new LokiError(
       `${label} "${value}" must be uppercase letters/digits/underscores only, length 1-16.`,
+    )
+  }
+}
+
+function assertDistinctPair(base: string, quote: string): void {
+  if (base === quote) {
+    throw new LokiError(
+      `FX rate base and quote must differ — got ${base} → ${quote}. An identity rate is not a meaningful exchange.`,
     )
   }
 }

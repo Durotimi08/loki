@@ -437,8 +437,13 @@ export function createReconciler(ctx: ReconcilerContext): Reconciler {
       const fullSweepSchedule = options.fullSweepSchedule
 
       let stopped = false
-      let nextResolve: ((r: RunOnceResult) => void) | null = null
-      let nextReject: ((e: unknown) => void) | null = null
+      // Every `nextPass()` call subscribes to the next pass via a
+      // fresh waiter; the next fire resolves all queued waiters and
+      // empties the list. Previously this was a single-slot
+      // (resolve, reject) pair, so a second concurrent `nextPass`
+      // overwrote the first and the first caller hung forever.
+      type Waiter = { resolve: (r: RunOnceResult) => void; reject: (e: unknown) => void }
+      const waiters: Waiter[] = []
       const timers = new Set<ReturnType<typeof setTimeout>>()
 
       const fire = async (fullSweep: boolean): Promise<void> => {
@@ -448,16 +453,14 @@ export function createReconciler(ctx: ReconcilerContext): Reconciler {
             ...(options.tenantId !== undefined ? { tenantId: options.tenantId } : {}),
             ...(fullSweep ? { fullSweep: true } : {}),
           })
-          if (nextResolve) {
-            nextResolve(result)
-            nextResolve = null
-            nextReject = null
+          if (waiters.length > 0) {
+            const drained = waiters.splice(0)
+            for (const w of drained) w.resolve(result)
           }
         } catch (e) {
-          if (nextReject) {
-            nextReject(e)
-            nextResolve = null
-            nextReject = null
+          if (waiters.length > 0) {
+            const drained = waiters.splice(0)
+            for (const w of drained) w.reject(e)
           } else if (options.onError) {
             options.onError(e)
           }
@@ -485,11 +488,17 @@ export function createReconciler(ctx: ReconcilerContext): Reconciler {
           stopped = true
           for (const t of timers) clearTimeout(t)
           timers.clear()
+          // Reject every queued waiter so callers don't hang past
+          // shutdown. Use a sentinel error class? — for now the
+          // standard Error is enough; tests rely on `.message`.
+          if (waiters.length > 0) {
+            const drained = waiters.splice(0)
+            for (const w of drained) w.reject(new Error('Reconciler stopped before next pass.'))
+          }
         },
         nextPass() {
-          return new Promise<RunOnceResult>((res, rej) => {
-            nextResolve = res
-            nextReject = rej
+          return new Promise<RunOnceResult>((resolve, reject) => {
+            waiters.push({ resolve, reject })
           })
         },
       }
@@ -772,7 +781,34 @@ async function checkHashChain(
     // Hashing is over the PLAINTEXT canonical form. Decrypt the
     // storage envelope here so a `payloadCrypto` deployment doesn't
     // trip `hash_chain_break` on every sweep.
-    const decryptedPayload = await decryptPayload(crypto, t.payload)
+    //
+    // A corrupted envelope or a stale key would otherwise throw and
+    // abort the entire reconciliation pass — one bad row would
+    // halt every other check across every tenant. Catch the
+    // failure, record it as a `hash_chain_break` anomaly with the
+    // decryption error, and keep going.
+    let decryptedPayload: unknown
+    try {
+      decryptedPayload = await decryptPayload(crypto, t.payload)
+    } catch (e) {
+      drafts.push({
+        tenantId: t.tenant_id,
+        check: 'hash_chain_break',
+        txnId: t.txn_id,
+        txnType: t.type,
+        expected: { decryptable: true },
+        observed: {
+          decryptable: false,
+          error: e instanceof Error ? e.message : String(e),
+        },
+        context: { transitionId: t.id },
+      })
+      integrityRecordIds.add(t.txn_id)
+      // Move the per-txn pointer forward so the next row in the
+      // same txn doesn't compare against a now-stale predecessor.
+      prevByTxn = { txn_id: t.txn_id, row_hash: Buffer.from(t.row_hash) }
+      continue
+    }
     const content: CanonicalValue = {
       id: t.id,
       txn_id: t.txn_id,
@@ -913,7 +949,16 @@ async function checkFxRateDrift(
       )
   `
   for (const t of rows) {
-    const payload = (await decryptPayload(crypto, t.payload)) as Record<string, unknown> | null
+    // A corrupted encrypted payload would otherwise abort the whole
+    // reconciliation pass; the hash-chain check above is the right
+    // place to flag it as `hash_chain_break`. Here we just skip the
+    // row — the FX check is advisory and shouldn't double-report.
+    let payload: Record<string, unknown> | null
+    try {
+      payload = (await decryptPayload(crypto, t.payload)) as Record<string, unknown> | null
+    } catch {
+      continue
+    }
     if (!payload) continue
     const declaredRate = payload['rate']
     const baseCurrency = payload['baseCurrency']

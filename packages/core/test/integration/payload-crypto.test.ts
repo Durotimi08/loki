@@ -231,4 +231,50 @@ describe('batch B — payload crypto', () => {
       companyShare: { $bigint: '20' },
     })
   })
+
+  it('reconciler keeps going past a corrupted encrypted envelope', async () => {
+    if (!dbUrl) return
+    const crypto = makeAesCrypto('rotation-key-v1')
+    const e = await reset(crypto)
+    const c = e.forTenant(TENANT)
+    const user = { type: 'User', id: 'u-corrupt' }
+    const driver = { type: 'Driver', id: 'd-corrupt' }
+    const company = { type: 'Company', id: 'co-corrupt' }
+    await c.accounts.create({ actor: user, name: 'wallet' })
+    await c.accounts.create({ actor: driver, name: 'balance' })
+    await c.accounts.create({ actor: company, name: 'revenue' })
+    await topUpWallet(e, TENANT, user.id, 1000n)
+    const txn = await c.transactions.create({
+      type: 'DeliveryPayment',
+      by: user,
+      participants: { user, driver, company },
+      idempotencyKey: 'corrupt:create',
+    })
+    const r = await c.transactions.transition({
+      id: txn.record.id,
+      name: 'pay',
+      by: user,
+      idempotencyKey: 'corrupt:pay',
+      data: { amount: 1000n, driverShare: 800n, companyShare: 200n },
+    })
+
+    // Corrupt the stored envelope so decryption throws. Without the
+    // try/catch the reconciler would abort the entire pass; with it,
+    // the bad row gets a `hash_chain_break` anomaly and the rest of
+    // the sweep continues.
+    await e.connection.sql.unsafe(
+      `update "txn_transitions"
+       set payload = '{"$encrypted": "v1:aes-256-gcm:not-real-base64"}'::jsonb
+       where id = '${r.transition.id}'`,
+    )
+
+    const result = await e.reconciler.runOnce({ tenantId: TENANT, quarantine: false })
+    // The pass completed (didn't throw), and recorded the corruption.
+    const integrity = result.anomalies.filter((a) => a.check === 'hash_chain_break')
+    expect(integrity.length).toBeGreaterThanOrEqual(1)
+    const decryptFailure = integrity.find(
+      (a) => (a.observed as { decryptable?: boolean })?.decryptable === false,
+    )
+    expect(decryptFailure).toBeDefined()
+  })
 })

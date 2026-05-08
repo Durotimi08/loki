@@ -128,6 +128,28 @@ describe('batch D — engine.fx', () => {
     ).rejects.toThrow(/rate/)
   })
 
+  it('rejects identity rates (base === quote)', async () => {
+    if (!engine) return
+    // An identity rate (NGN → NGN at 1.0) is nonsensical and would
+    // confuse the fx_rate_drift reconciler check. publish, lookup,
+    // and history all guard against it.
+    await expect(
+      engine.fx.publish({
+        tenantId: TENANT,
+        baseCurrency: 'NGN',
+        quoteCurrency: 'NGN',
+        rate: '1.0',
+        source: 'x',
+      }),
+    ).rejects.toThrow(/base and quote must differ/)
+    await expect(
+      engine.fx.lookup({ tenantId: TENANT, baseCurrency: 'NGN', quoteCurrency: 'NGN' }),
+    ).rejects.toThrow(/base and quote must differ/)
+    await expect(
+      engine.fx.history({ tenantId: TENANT, baseCurrency: 'NGN', quoteCurrency: 'NGN' }),
+    ).rejects.toThrow(/base and quote must differ/)
+  })
+
   it('respects expires_at on lookup', async () => {
     if (!engine) return
     const t1 = new Date('2026-01-01T00:00:00Z')

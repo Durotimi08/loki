@@ -479,20 +479,19 @@ async function runHealthCheck(
   const primary = await withTimeout(probePrimary(), timeoutMs, 'primary')
 
   let replica: ReplicaHealth | null = null
-  if (connection.hasReplica) {
+  if (connection.readSql) {
     const start = Date.now()
     try {
+      // The probe MUST NOT go through `withTenantReplica` — that path
+      // consults the read-your-writes LSN tracker and would route to
+      // the primary if the current async context has a recent write,
+      // masking real replica lag. Hit the replica pool directly with
+      // a read-only `pg_*` query that bypasses RLS entirely.
+      const replicaSql = connection.readSql
       const rows = await withTimeout(
-        connection.withTenantReplica('__health__', async (tx) => {
-          // Health probe runs admin-style read-only against the
-          // replica pool. We don't actually touch any tenant rows;
-          // the GUC is just there to satisfy the `withTenant*` API
-          // (RLS policies check current_setting but tenant_id is
-          // never compared because the query reads `pg_*` views).
-          return await tx<{ lsn: string | null }[]>`
-            select pg_last_wal_replay_lsn()::text as lsn
-          `
-        }),
+        replicaSql<{ lsn: string | null }[]>`
+          select pg_last_wal_replay_lsn()::text as lsn
+        `,
         timeoutMs,
         'replica',
       )

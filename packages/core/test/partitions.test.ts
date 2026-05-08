@@ -12,6 +12,7 @@ import { buildPartitionsOps } from '../src/index.js'
 
 const fakeConnection = {
   sql: {} as never,
+  readSql: null,
   hasReplica: false,
   withTenant: async () => undefined as never,
   withTenantReplica: async () => undefined as never,

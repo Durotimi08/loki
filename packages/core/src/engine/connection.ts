@@ -80,6 +80,15 @@ export type ConnectionInput =
 export type Connection = {
   /** The underlying postgres.js client (primary, accepts writes). */
   readonly sql: SqlClient
+  /**
+   * The configured read-replica client, or `null` when none was
+   * supplied. Exposed for cases that need to hit the replica
+   * directly without going through `withTenantReplica` — most
+   * notably the health probe, which must NOT consult the LSN
+   * tracking (otherwise an in-flight write masks real replica lag).
+   * Application code should normally use `withTenantReplica` instead.
+   */
+  readonly readSql: SqlClient | null
   /** Whether a read-replica was configured. */
   readonly hasReplica: boolean
   /**
@@ -273,6 +282,7 @@ export function openConnection(input: ConnectionInput): Connection {
 
   return {
     sql,
+    readSql,
     hasReplica: readSql !== null,
     async withTenant<T>(tenantId: string, fn: (tx: SqlTransaction) => Promise<T>): Promise<T> {
       return ensureLsnContext(() => runOn(sql, tenantId, fn, true))
@@ -376,6 +386,7 @@ export function withSearchPath(base: Connection, schemaName: string): Connection
   }
   return {
     sql: base.sql,
+    readSql: base.readSql,
     hasReplica: base.hasReplica,
     async withTenant(tenantId, fn) {
       return base.withTenant(tenantId, async (tx) => {

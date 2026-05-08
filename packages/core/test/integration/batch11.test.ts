@@ -30,10 +30,15 @@ const User = defineActor('User', {
     ngn_wallet: { currency: 'NGN' },
   },
 })
+// Bank's FX clearing accounts are explicitly liability-style — they
+// accumulate cross-currency imbalance and can run negative as the
+// engine debits one side and credits the other. `allowOverdraft: true`
+// is the right semantic here (the new default `false` would refuse
+// the FX transition).
 const Bank = defineActor('Bank', {
   accounts: {
-    fx_usd: { currency: 'USD' },
-    fx_ngn: { currency: 'NGN' },
+    fx_usd: { currency: 'USD', allowOverdraft: true },
+    fx_ngn: { currency: 'NGN', allowOverdraft: true },
   },
 })
 

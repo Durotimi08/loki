@@ -28,13 +28,19 @@ export type AccountOptions = {
    */
   readonly parent?: string
   /**
-   * If `false`, the engine refuses any transition that would take this
-   * account's balance below zero — `OverdraftError` thrown pre-commit
-   * so the tx rolls back. Default `true` for back-compat (existing
-   * schemas continue to allow negative balances). Sharded accounts
-   * cannot disable overdraft because the constraint is on the sum
-   * across shards but writers update one shard each, racing the check;
-   * `defineActor` rejects the combination at schema-build time.
+   * If `false` (the default), the engine refuses any transition that
+   * would take this account's balance below zero — `OverdraftError`
+   * thrown pre-commit so the tx rolls back. This is the safe default
+   * for a money-movement library: a customer wallet, a merchant
+   * balance, an escrow account should never silently go negative.
+   *
+   * Set `true` for accounts that legitimately track liability or
+   * imbalance: an external-funding source (bank rail), an FX
+   * clearing leg, a consignment account. Sharded accounts cannot
+   * combine `allowOverdraft: false` with `shards > 1` — the
+   * constraint is on the sum across shards but writers update one
+   * shard each, racing the check; `defineActor` rejects the
+   * combination at schema-build time.
    */
   readonly allowOverdraft?: boolean
 }

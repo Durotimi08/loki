@@ -107,14 +107,4 @@ The reconciler runs as `loki_admin` (no tenant GUC), so cross-tenant integrity s
 - `payloadCrypto` and HMAC keys (`@loki/hmac` / `signOutboxPayload`) belong in a KMS, not the runtime env. Pass them at boot via your secret manager → in-memory delivery, never written to disk.
 - Loki itself never logs the connection string or payload contents at any level. If you wrap the engine in custom logging, **explicitly redact** payloads — your hooks see plaintext.
 
----
-
-## Reporting a vulnerability
-
-If you find a security issue in Loki, please email **security@<your-org>.example** rather than opening a public issue. We aim to acknowledge within one business day and ship a fix within two weeks for confirmed issues. Please include:
-
-- Affected version / commit.
-- Reproduction steps (a failing test is ideal).
-- Impact assessment if you have one.
-
 The package is small and the threat model is clear; we don't expect a long backlog.

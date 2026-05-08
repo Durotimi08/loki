@@ -23,7 +23,7 @@ import {
   isEncryptedEnvelope,
   sha256Hasher,
 } from '../../src/index.js'
-import { chidoriSchema } from '../fixtures.js'
+import { chidoriSchema, topUpWallet } from '../fixtures.js'
 import { ensurePostgres, teardownPostgres } from './setup.js'
 
 const TENANT = 'org-crypto'
@@ -99,6 +99,7 @@ describe('batch B — payload crypto', () => {
     await c.accounts.create({ actor: user, name: 'wallet' })
     await c.accounts.create({ actor: driver, name: 'balance' })
     await c.accounts.create({ actor: company, name: 'revenue' })
+    await topUpWallet(e, TENANT, user.id, 1000n)
 
     const txn = await c.transactions.create({
       type: 'DeliveryPayment',
@@ -166,6 +167,7 @@ describe('batch B — payload crypto', () => {
     await c.accounts.create({ actor: user, name: 'wallet' })
     await c.accounts.create({ actor: driver, name: 'balance' })
     await c.accounts.create({ actor: company, name: 'revenue' })
+    await topUpWallet(e, TENANT, user.id, 500n)
     const txn = await c.transactions.create({
       type: 'DeliveryPayment',
       by: user,
@@ -180,9 +182,14 @@ describe('batch B — payload crypto', () => {
       data: { amount: 500n, driverShare: 400n, companyShare: 100n },
     })
 
-    // Encrypted-at-rest plus a clean hash chain → no anomalies.
+    // Encrypted-at-rest plus a clean hash chain → no INTEGRITY-class
+    // anomalies. The raw-SQL `topUpWallet` will produce a
+    // balance_drift, which the reconciler is supposed to catch — that
+    // proves the reconciler still runs end-to-end under encryption.
+    // What we're verifying here is the hash chain specifically.
     const result = await e.reconciler.runOnce({ tenantId: TENANT })
-    expect(result.anomalies).toEqual([])
+    expect(result.anomalies.filter((a) => a.check === 'hash_chain_break')).toEqual([])
+    expect(result.anomalies.filter((a) => a.check === 'checksum_mismatch')).toEqual([])
 
     // queries.verify also recomputes over plaintext.
     const verify = await c.queries.verify(txn.record.id, sha256Hasher)
@@ -199,6 +206,7 @@ describe('batch B — payload crypto', () => {
     await c.accounts.create({ actor: user, name: 'wallet' })
     await c.accounts.create({ actor: driver, name: 'balance' })
     await c.accounts.create({ actor: company, name: 'revenue' })
+    await topUpWallet(e, TENANT, user.id, 100n)
     const txn = await c.transactions.create({
       type: 'DeliveryPayment',
       by: user,

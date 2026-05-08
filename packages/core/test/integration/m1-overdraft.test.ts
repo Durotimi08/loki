@@ -1,8 +1,10 @@
 /**
  * Batch A — M1 overdraft opt-in.
  *
- *   - allowOverdraft: false rejects debits that would take balance < 0
- *   - allowOverdraft: true (default) lets balances go negative
+ *   - allowOverdraft: false (the default) rejects debits that would
+ *     take balance < 0
+ *   - allowOverdraft: true lets balances go negative — used for
+ *     external-funding sources, FX clearing legs, liability accounts
  *   - Reversal transitions bypass overdraft (admin operation)
  *   - Combination with shards is refused at schema-build time
  */
@@ -29,8 +31,11 @@ const Org = defineTenant('Org')
 const User = defineActor('User', {
   accounts: { wallet: { currency: 'NGN', allowOverdraft: false } },
 })
+// `Driver.balance` opts INTO overdraft so the test that exercises
+// "default-permissive" behaviour against the prior `?? true` default
+// keeps a target. The default is now `false`.
 const Driver = defineActor('Driver', {
-  accounts: { balance: { currency: 'NGN' } }, // default: allowOverdraft true
+  accounts: { balance: { currency: 'NGN', allowOverdraft: true } },
 })
 const Company = defineActor('Company', {
   accounts: { revenue: { currency: 'NGN' } },

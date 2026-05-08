@@ -26,7 +26,7 @@ import {
   runSaga,
   sha256Hasher,
 } from '../../src/index.js'
-import { chidoriSchema } from '../fixtures.js'
+import { chidoriSchema, topUpWallet } from '../fixtures.js'
 import { ensurePostgres, teardownPostgres } from './setup.js'
 
 const TENANT = 'org-batch8'
@@ -69,6 +69,7 @@ const drivePay = async (
   await c.accounts.create({ actor: user, name: 'wallet' })
   await c.accounts.create({ actor: driver, name: 'balance' })
   await c.accounts.create({ actor: company, name: 'revenue' })
+  await topUpWallet(e, TENANT, user.id, 1500n)
   const txn = await c.transactions.create({
     type: 'DeliveryPayment',
     by: user,
@@ -382,6 +383,7 @@ describe('bulkTransition', () => {
       await tenant.accounts.create({ actor: user, name: 'wallet' })
       await tenant.accounts.create({ actor: driver, name: 'balance' })
       await tenant.accounts.create({ actor: company, name: 'revenue' })
+      await topUpWallet(engine, TENANT, user.id, 1500n)
       const txn = await tenant.transactions.create({
         type: 'DeliveryPayment',
         by: user,

@@ -1,5 +1,11 @@
 import type { StandardSchemaV1 } from '@standard-schema/spec'
-import { defineActor, defineSchema, defineTenant, defineTransaction } from '../src/index.js'
+import {
+  type Engine,
+  defineActor,
+  defineSchema,
+  defineTenant,
+  defineTransaction,
+} from '../src/index.js'
 
 /**
  * Stand-in for a Standard Schema validator. Real consumers will plug in
@@ -34,10 +40,14 @@ export const Driver = defineActor('Driver', {
 
 export const Company = defineActor('Company', {
   accounts: {
-    revenue: { currency: 'NGN', shards: 16 },
-    promo_pool: { currency: 'NGN' },
-    escrow: { currency: 'NGN', shards: 8 },
-    chargebacks: { currency: 'NGN' },
+    // Revenue + escrow are sharded for hot-path concurrency — sharded
+    // accounts can't enforce overdraft (the guard would race), so we
+    // explicitly opt them in. Both are credit-accumulating in
+    // practice, so the lack of guard is fine.
+    revenue: { currency: 'NGN', shards: 16, allowOverdraft: true },
+    promo_pool: { currency: 'NGN', allowOverdraft: true },
+    escrow: { currency: 'NGN', shards: 8, allowOverdraft: true },
+    chargebacks: { currency: 'NGN', allowOverdraft: true },
   },
 })
 
@@ -94,3 +104,35 @@ export const chidoriSchema = defineSchema({
   actors: [User, Driver, Company, System],
   transactions: [DeliveryPayment],
 })
+
+/**
+ * Test helper: pre-fund a User wallet via raw SQL.
+ *
+ * In production code the right pattern is a typed top-up transaction
+ * (see `examples/escrow-with-stripe` for the WalletTopUp pattern that
+ * keeps the reconciler happy). The chidori fixture deliberately does
+ * NOT include a top-up transition because most tests don't care about
+ * the funding mechanism — they care about the engine machinery.
+ *
+ * This helper writes directly to `accounts.balance`, which the
+ * engine's overdraft check consults; tests that drive `pay` against
+ * an unfunded wallet would otherwise hit `OverdraftError`. The
+ * reconciler will report the resulting drift, so tests that *also*
+ * exercise the reconciler should either repair the drift
+ * (`runOnce({ repairBalanceDrift: true })`) or use a real top-up
+ * transition.
+ */
+export async function topUpWallet(
+  engine: Engine,
+  tenantId: string,
+  userId: string,
+  amount: bigint,
+): Promise<void> {
+  await engine.connection.sql.unsafe(
+    `update "accounts" set balance = ${amount.toString()}::numeric
+     where tenant_id = '${tenantId}'
+       and owner_actor_type = 'User'
+       and owner_actor_id = '${userId}'
+       and name = 'wallet'`,
+  )
+}

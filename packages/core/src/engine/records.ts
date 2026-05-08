@@ -633,7 +633,11 @@ async function runTransitionInner(
     for (const [accountId, delta] of netByAccount) {
       // Loki accounts represent "what does this actor have right now" —
       // money INTO the account is a credit, money OUT is a debit.
-      const allowOverdraft = overdraftByAccount.get(accountId) ?? true
+      // Default false — for an account whose schema declaration we
+      // can't find at runtime (shouldn't happen; defensive), fall
+      // back to refusing overdraft. Better to reject the tx than to
+      // silently let an unknown account go negative.
+      const allowOverdraft = overdraftByAccount.get(accountId) ?? false
       const enforce = !isReversal && !allowOverdraft && delta < 0n
       if (enforce) {
         // Guarded update — returns 0 rows when the new balance would
@@ -1169,7 +1173,7 @@ async function resolveDrafts(
       direction: d.direction,
       amount: d.amount,
       currency: ref.currency,
-      allowOverdraft: accountDef?.allowOverdraft ?? true,
+      allowOverdraft: accountDef?.allowOverdraft ?? false,
     })
   }
   return out
@@ -1243,7 +1247,11 @@ async function resolveInvertReference(
       direction: r.direction === 'D' ? ('C' as const) : ('D' as const),
       amount: BigInt(r.amount),
       currency: r.currency,
-      allowOverdraft: def?.allowOverdraft ?? true,
+      // Reversals bypass the overdraft check anyway (`isReversal` in
+      // runTransition skips the guard), so this fallback is mostly
+      // belt-and-suspenders. Keep it `false` to match the schema-side
+      // default.
+      allowOverdraft: def?.allowOverdraft ?? false,
     })
   }
   return { postings: inverted, reversesTransitionId: original.id }

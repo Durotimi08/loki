@@ -26,7 +26,12 @@ export const Driver = defineActor('Driver', {
 
 export const Company = defineActor('Company', {
   accounts: {
-    revenue: { currency: 'NGN', shards: 16 }, // hot-account sharding
+    // Sharded accounts can't enforce the overdraft guard (the
+    // cross-shard balance check would race with single-shard writers),
+    // so they require an explicit `allowOverdraft: true`. Revenue
+    // is credit-accumulating in practice, so the lack of guard is
+    // fine here.
+    revenue: { currency: 'NGN', shards: 16, allowOverdraft: true },
   },
 })
 

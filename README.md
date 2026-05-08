@@ -171,6 +171,8 @@ import { z } from 'zod' // or valibot, arktype — any Standard Schema validator
 const Org = defineTenant('Org')
 
 const User = defineActor('User', {
+  // Default `allowOverdraft: false` — wallet must be funded before
+  // the first debit. Top up via a separate `WalletTopUp` transition.
   accounts: { wallet: { currency: 'NGN' } },
 })
 const Driver = defineActor('Driver', {
@@ -178,9 +180,37 @@ const Driver = defineActor('Driver', {
 })
 const Company = defineActor('Company', {
   accounts: {
-    revenue: { currency: 'NGN', shards: 16 }, // hot-account sharding
+    // Sharded accounts require explicit `allowOverdraft: true` —
+    // the cross-shard balance check would race with single-shard
+    // writers. Revenue is credit-accumulating in practice, so this
+    // is fine.
+    revenue: { currency: 'NGN', shards: 16, allowOverdraft: true },
     promo_pool: { currency: 'NGN' },
   },
+})
+const Funder = defineActor('Funder', {
+  // Liability account for top-ups. Credits flow OUT to user wallets,
+  // so the source itself runs negative — opt in to overdraft.
+  accounts: { source: { currency: 'NGN', allowOverdraft: true } },
+})
+
+const WalletTopUp = defineTransaction('WalletTopUp', {
+  states: ['pending', 'completed'],
+  initial: 'pending',
+  terminal: ['completed'],
+  participants: { user: User, funder: Funder },
+  transitions: (t) => ({
+    deposit: t({
+      from: 'pending',
+      to: 'completed',
+      by: [Funder],
+      payload: z.object({ amount: z.bigint() }),
+      postings: ({ data, participants }) => [
+        { direction: 'D', account: participants.funder.source, amount: data.amount },
+        { direction: 'C', account: participants.user.wallet, amount: data.amount },
+      ],
+    }),
+  }),
 })
 
 const DeliveryPayment = defineTransaction('DeliveryPayment', {
@@ -221,8 +251,8 @@ const DeliveryPayment = defineTransaction('DeliveryPayment', {
 
 export default defineSchema({
   tenant: Org,
-  actors: [User, Driver, Company],
-  transactions: [DeliveryPayment],
+  actors: [User, Driver, Company, Funder],
+  transactions: [WalletTopUp, DeliveryPayment],
 })
 ```
 
@@ -262,9 +292,28 @@ const user = { type: 'User', id: 'u-1' }
 const driver = { type: 'Driver', id: 'd-1' }
 const company = { type: 'Company', id: 'co-1' }
 
+const funder = { type: 'Funder', id: 'demo-bank' }
+
 await c.accounts.create({ actor: user, name: 'wallet' })
 await c.accounts.create({ actor: driver, name: 'balance' })
 await c.accounts.create({ actor: company, name: 'revenue' })
+await c.accounts.create({ actor: funder, name: 'source' })
+
+// Fund the wallet via a typed top-up transaction. (No raw SQL — the
+// reconciler would catch the resulting balance drift.)
+const top = await c.transactions.create({
+  type: 'WalletTopUp',
+  by: funder,
+  participants: { user, funder },
+  idempotencyKey: 'topup:1',
+})
+await c.transactions.transition({
+  id: top.record.id,
+  name: 'deposit',
+  by: funder,
+  data: { amount: 5000n },
+  idempotencyKey: 'topup:1:deposit',
+})
 
 const txn = await c.transactions.create({
   type: 'DeliveryPayment',
@@ -317,17 +366,31 @@ If any invariant fails, nothing is written. Atomic or nothing.
 
 ### Overdraft policy
 
-Per-account opt-in via the schema. When `allowOverdraft: false`, the engine refuses any transition that would take the cached balance below zero — `OverdraftError` thrown pre-commit, tx rolled back, balance unchanged.
+The default is **`allowOverdraft: false`** — the safe posture for a money-movement library. The engine refuses any transition that would take an account's cached balance below zero (`OverdraftError` thrown pre-commit, tx rolled back, balance unchanged).
+
+Opt INTO overdraft for accounts that legitimately track liability or imbalance — an external-funding source (a bank rail), an FX clearing leg, a sharded credit-accumulating account:
 
 ```ts
-const User = defineActor('User', {
+const Bank = defineActor('Bank', {
   accounts: {
-    wallet: { currency: 'NGN', allowOverdraft: false }, // refuse negatives
+    // Credits buyer wallets via top-ups; runs negative as a liability.
+    source: { currency: 'NGN', allowOverdraft: true },
+  },
+})
+
+const Platform = defineActor('Platform', {
+  accounts: {
+    // Sharded accounts can't enforce overdraft (the cross-shard
+    // balance check would race with single-shard writers), so they
+    // require an explicit `allowOverdraft: true`.
+    revenue: { currency: 'NGN', shards: 16, allowOverdraft: true },
   },
 })
 ```
 
-Default is `true` (back-compat: existing schemas keep allowing negatives). Reversal transitions (`postings: 'invert:...'`) bypass the check — refunds need to land regardless of the recipient's spending. `allowOverdraft: false` cannot combine with `shards > 1` (the cross-shard race makes the check unenforceable); the schema builder rejects it at construction.
+Reversal transitions (`postings: 'invert:...'`) bypass the check — refunds must land regardless of the recipient's current balance. `allowOverdraft: false` cannot combine with `shards > 1` (the cross-shard race makes the check unenforceable); the schema builder rejects the combination at construction.
+
+**Funding wallets.** Because consumer wallets default to `allowOverdraft: false`, the first transition on a fresh wallet must come from a credit posting — typically a typed top-up transaction that debits a `Bank` / `Funder` source account (which DOES allow overdraft) and credits the wallet. See `examples/escrow-with-stripe/` for the full pattern.
 
 ### Multi-tenancy (three modes)
 

@@ -130,9 +130,11 @@ export function lookupAccountDecl(
   if (!account) {
     throw new LokiError(`Actor "${actorType}" has no account named "${accountName}".`)
   }
-  // `allowOverdraft` defaults true for any schema authored before M1
-  // shipped. New schemas that opt in flip it to false on creation.
-  return { ...account, allowOverdraft: account.allowOverdraft ?? true }
+  // `allowOverdraft` defaults false — see schema/types.ts. The schema
+  // builder bakes the resolved value into every AccountDef, so this
+  // fallback only kicks in for hand-rolled actor objects that bypass
+  // `defineActor`.
+  return { ...account, allowOverdraft: account.allowOverdraft ?? false }
 }
 
 export async function provisionShards(

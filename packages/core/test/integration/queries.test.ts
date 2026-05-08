@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { type Engine, MIGRATIONS_TABLE, createEngine } from '../../src/index.js'
-import { chidoriSchema } from '../fixtures.js'
+import { chidoriSchema, topUpWallet } from '../fixtures.js'
 import { ensurePostgres, teardownPostgres } from './setup.js'
 
 const TENANT = 'org-queries'
@@ -45,6 +45,8 @@ const setupAndPay = async (
   await client.accounts.create({ actor: user, name: 'wallet' })
   await client.accounts.create({ actor: driver, name: 'balance' })
   await client.accounts.create({ actor: company, name: 'revenue' })
+  // Pre-fund — overdraft is now refused by default. Cover all `count` pays.
+  await topUpWallet(e, TENANT, user.id, BigInt(count) * 1500n)
   for (let i = 0; i < count; i++) {
     const txn = await client.transactions.create({
       type: 'DeliveryPayment',

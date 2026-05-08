@@ -45,7 +45,11 @@ export function defineActor<
   for (const accountName of Object.keys(specs)) {
     const opts = specs[accountName] as AccountOptions
     const shards = opts.shards ?? 1
-    const allowOverdraft = opts.allowOverdraft ?? true
+    // Default `false` — for a money-movement library, the safe
+    // posture is "refuse to take an account negative unless the
+    // schema explicitly opts in." Liability accounts, FX clearing,
+    // and external-funding sources opt in via `allowOverdraft: true`.
+    const allowOverdraft = opts.allowOverdraft ?? false
     if (!allowOverdraft && shards > 1) {
       // Cross-shard balance check would race with concurrent
       // single-shard writes — the constraint is unenforceable. Refuse

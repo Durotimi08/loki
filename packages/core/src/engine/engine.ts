@@ -125,20 +125,9 @@ export type EngineOptions = {
    */
   readonly tracer?: Tracer
   /**
-   * Optional structured logger for the engine's OWN operational
-   * events — engine started, migration applied, outbox worker
-   * stopped, connection error. Without one, the engine is silent
-   * (NOOP_LOGGER) so existing tests don't suddenly start writing to
-   * stdout.
-   *
-   * The shape is a deliberate subset of pino / winston / bunyan, so
-   * adapting any of them is a one-line wrapper. For development, see
-   * `consoleLogger()` — JSON-per-line on stdout/stderr.
-   *
-   * Production wiring: emit JSON to stdout, let your container
-   * runtime + log shipper carry it to your aggregator. Don't log to
-   * a file inside the application — the filesystem is ephemeral and
-   * retention belongs at the aggregator.
+   * Optional structured logger for the engine's operational events.
+   * Without one the engine is silent (`NOOP_LOGGER`). See
+   * `consoleLogger()` for a development default.
    */
   readonly logger?: Logger
 }

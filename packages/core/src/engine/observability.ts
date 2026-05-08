@@ -43,40 +43,9 @@ export type Tracer = {
 }
 
 // ----------------------------------------------------------------------
-// Logger — for the engine's OWN operational events (engine started,
-// migration applied, outbox worker stopped, connection error).
-//
-// Why this exists when we already have hooks/metrics/tracer:
-//
-//   - Hooks fire on DOMAIN events (transitions, anomalies, reconciler
-//     completions) — they're what application code subscribes to.
-//   - Metrics aggregate numbers — counts, durations, gauges. You
-//     can't search metrics by tenant id or correlate across services.
-//   - Tracer is per-request — spans are tied to a specific operation.
-//   - Logger is for everything else: the engine emitting "I started",
-//     "the connection pool errored at 03:42", "scheduler worker
-//     stopped". Structured records, with fields, that ship to your
-//     log aggregator.
-//
-// The shape is a deliberate subset of pino / winston / bunyan so
-// adapting any of them is a one-line wrapper.
-//
-// Production wiring belongs in the application, not here:
-//
-//   - Emit JSON to stdout (pino's default).
-//   - Container runtime captures stdout.
-//   - Log shipper (Fluent Bit / Vector / Datadog Agent) ships to
-//     your aggregator (Datadog, Splunk, CloudWatch, Grafana Loki,
-//     ELK).
-//   - Retention policy lives on the aggregator (e.g. 30d hot, 1y
-//     warm, archived). NEVER summarise inside the application.
-//
-// File-based logging (`log.txt`) is an anti-pattern in containerised
-// deployments — the filesystem is ephemeral, files race under
-// concurrent writers, and `grep` across N replicas isn't an
-// operational story. If you need that for a single-node deployment,
-// pipe stdout through `tee log.txt` at the OS level instead of
-// teaching the engine to write a file.
+// Logger — operational events from the engine itself (engine started,
+// migration applied, reconciler pass finished, outbox terminal
+// failure). Shape is a subset of pino / winston / bunyan.
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 
@@ -139,17 +108,8 @@ export const NOOP_LOGGER: Logger = {
 }
 
 /**
- * Convenience factory: a structured-console logger suitable for
- * development. Each record is one JSON line on stdout (or stderr for
- * error-level), matching pino's default — which is what most log
- * shippers parse natively.
- *
- * Production code should swap this for a real logger (pino, winston,
- * bunyan, or whatever ships to your aggregator) by passing it into
- * `createEngine({ logger })`.
- *
- * Default level is `'info'`. `'debug'` records are silent unless you
- * pass `{ level: 'debug' }`.
+ * JSON-per-line logger for development. Records on stdout,
+ * error/warn on stderr. Default level `'info'`.
  */
 export function consoleLogger(opts: { readonly level?: LogLevel } = {}): Logger {
   const minLevel = opts.level ?? 'info'

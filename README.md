@@ -366,31 +366,28 @@ If any invariant fails, nothing is written. Atomic or nothing.
 
 ### Overdraft policy
 
-The default is **`allowOverdraft: false`** — the safe posture for a money-movement library. The engine refuses any transition that would take an account's cached balance below zero (`OverdraftError` thrown pre-commit, tx rolled back, balance unchanged).
+Default `allowOverdraft: false`. The engine refuses any transition that would take an account's cached balance below zero (`OverdraftError` thrown pre-commit, tx rolled back, balance unchanged).
 
-Opt INTO overdraft for accounts that legitimately track liability or imbalance — an external-funding source (a bank rail), an FX clearing leg, a sharded credit-accumulating account:
+Opt in for liability or imbalance accounts:
 
 ```ts
 const Bank = defineActor('Bank', {
   accounts: {
-    // Credits buyer wallets via top-ups; runs negative as a liability.
     source: { currency: 'NGN', allowOverdraft: true },
   },
 })
 
 const Platform = defineActor('Platform', {
   accounts: {
-    // Sharded accounts can't enforce overdraft (the cross-shard
-    // balance check would race with single-shard writers), so they
-    // require an explicit `allowOverdraft: true`.
+    // Sharded accounts must opt in (cross-shard race).
     revenue: { currency: 'NGN', shards: 16, allowOverdraft: true },
   },
 })
 ```
 
-Reversal transitions (`postings: 'invert:...'`) bypass the check — refunds must land regardless of the recipient's current balance. `allowOverdraft: false` cannot combine with `shards > 1` (the cross-shard race makes the check unenforceable); the schema builder rejects the combination at construction.
+Reversal transitions (`postings: 'invert:...'`) bypass the check. `allowOverdraft: false` cannot combine with `shards > 1`; the schema builder rejects the combination at construction.
 
-**Funding wallets.** Because consumer wallets default to `allowOverdraft: false`, the first transition on a fresh wallet must come from a credit posting — typically a typed top-up transaction that debits a `Bank` / `Funder` source account (which DOES allow overdraft) and credits the wallet. See `examples/escrow-with-stripe/` for the full pattern.
+A fresh wallet defaults to `allowOverdraft: false`, so the first transition on it must be a credit — typically a typed top-up debiting a `Bank` / `Funder` source. See `examples/escrow-with-stripe/`.
 
 ### Multi-tenancy (three modes)
 
@@ -701,22 +698,21 @@ The pre-built instruments (`engine.instruments.*`) cover every transition (durat
 
 ### Logging (operational events)
 
-The engine emits structured records — engine started, migration applied, reconciliation pass finished, outbox dispatch failed terminally — through a `Logger` plug-in following the same shape as `metrics` and `tracer`. The interface is a deliberate subset of pino / winston / bunyan so adapting any of them is a one-line wrapper. Without a logger, the engine is silent.
+A `Logger` plug-in for the engine's operational events (engine started, migration applied, reconciliation pass finished, outbox dispatch failed terminally). Same shape as `metrics` and `tracer` — a subset of pino / winston / bunyan. Without a logger, the engine is silent.
 
 ```ts
 import { createEngine, consoleLogger } from '@loki/core'
 
-// Development: JSON-per-line on stdout/stderr.
 const engine = createEngine({
   schema,
   connection,
   logger: consoleLogger({ level: 'info' }),
 })
 
-// Production: bring your own.
+// Or wire your own (pino, winston, bunyan, …):
 import pino from 'pino'
 const log = pino()
-const engine = createEngine({
+createEngine({
   schema,
   connection,
   logger: {
@@ -724,19 +720,10 @@ const engine = createEngine({
     info:  (m, f) => log.info(f, m),
     warn:  (m, f) => log.warn(f, m),
     error: (m, f) => log.error(f instanceof Error ? { err: f } : f, m),
-    child: (f) => /* wrap pino.child(f) the same way */ /* … */ engine.instruments.logger,
+    child: (f) => /* wrap pino.child(f) */ engine.instruments.logger,
   },
 })
 ```
-
-**Why a plug-in and not a `log.txt` file:** containerised deployments treat the filesystem as ephemeral — a file in the app disappears when the pod restarts, races under concurrent writers, and doesn't help you when there are 100 replicas. The right pattern is:
-
-1. App emits structured logs to stdout (one JSON object per line — `consoleLogger()` does this).
-2. The container runtime (k8s, systemd, ECS) captures stdout.
-3. A log shipper (Fluent Bit, Vector, Datadog Agent) ships records to your aggregator.
-4. The aggregator (Datadog, Splunk, CloudWatch, Grafana Loki, ELK) handles **retention** (e.g. 30 days hot, 1 year warm), **search**, **alerts**, and **dashboards**.
-
-Don't summarise inside the app — summarisation is a query you run in the aggregator. If you need a single-node tail-able log, pipe stdout: `node app.js | tee log.txt | rotatelogs …`. The engine stays out of the file business.
 
 ### Schema evolution
 

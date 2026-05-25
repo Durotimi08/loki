@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist-tarballs/
 coverage/
 *.log
 .DS_Store

@@ -3,6 +3,7 @@
 exports[`planInitialMigration — Chidori fixture > toDownSql matches the golden snapshot 1`] = `
 "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM "ledger_app";
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM "ledger_admin";
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM "ledger_readonly";
 
 DROP POLICY IF EXISTS "txn_disputes_tenant_isolation" ON "txn_disputes";
 
@@ -105,6 +106,9 @@ BEGIN
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ledger_admin') THEN
     CREATE ROLE "ledger_admin" NOLOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ledger_readonly') THEN
+    CREATE ROLE "ledger_readonly" NOINHERIT NOLOGIN;
   END IF;
 END
 $$;
@@ -548,6 +552,34 @@ ON "txn_anomalies" TO "ledger_app";
 
 GRANT UPDATE ("status", "attempts", "last_error", "fired_at", "fired_transition_id")
 ON "txn_scheduled" TO "ledger_app";
+
+REVOKE ALL ON SCHEMA public FROM "ledger_readonly";
+REVOKE ALL ON ALL TABLES    IN SCHEMA public FROM "ledger_readonly";
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM "ledger_readonly";
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM "ledger_readonly";
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES    FROM "ledger_readonly";
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM "ledger_readonly";
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM "ledger_readonly";
+
+GRANT SELECT ON
+  "tenants",
+  "accounts",
+  "txn_records",
+  "txn_transitions",
+  "txn_keys",
+  "postings",
+  "outbox",
+  "txn_anomalies",
+  "txn_scheduled",
+  "fx_rates",
+  "txn_holds",
+  "txn_disputes"
+TO "ledger_readonly";
+
+ALTER DEFAULT PRIVILEGES FOR ROLE "ledger_admin" IN SCHEMA public
+  GRANT SELECT ON TABLES TO "ledger_readonly";
+
+ALTER ROLE "ledger_readonly" SET search_path = 'public';
 
 "
 `;

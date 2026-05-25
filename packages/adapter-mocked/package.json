@@ -1,6 +1,6 @@
 {
   "name": "@loki/adapter-mocked",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Deterministic simulated PSP adapter for tests.",
   "license": "Apache-2.0",
   "type": "module",

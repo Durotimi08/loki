@@ -21,6 +21,7 @@ import type { ResolvedMigrationOptions } from './types.js'
 export function buildRolesSql(options: ResolvedMigrationOptions): string[] {
   const app = ident(options.appRole)
   const admin = ident(options.adminRole)
+  const ro = ident(options.readonlyRole)
   const stmts: string[] = []
 
   stmts.push(
@@ -31,6 +32,9 @@ BEGIN
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ${quoteRoleLiteral(options.adminRole)}) THEN
     CREATE ROLE ${admin} NOLOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ${quoteRoleLiteral(options.readonlyRole)}) THEN
+    CREATE ROLE ${ro} NOINHERIT NOLOGIN;
   END IF;
 END
 $$;
@@ -48,6 +52,7 @@ $$;
 export function buildGrantsSql(options: ResolvedMigrationOptions): string[] {
   const app = ident(options.appRole)
   const admin = ident(options.adminRole)
+  const ro = ident(options.readonlyRole)
   const t = (name: string) => ident(`${options.tablePrefix}${name}`)
   const stmts: string[] = []
 
@@ -147,12 +152,62 @@ ON ${t('txn_scheduled')} TO ${app};
 `,
   )
 
+  // ============================================================
+  // ledger_readonly — DASHBOARD.md §8.10 layer 4
+  // ============================================================
+  // The dashboard pool runs as this role. SELECT on Loki's tables
+  // ONLY. We REVOKE every public-schema privilege first so a fresh
+  // role doesn't inherit anything Postgres grants to PUBLIC. The
+  // search_path is pinned to the engine's schema, so an unqualified
+  // `SELECT * FROM users` can't even resolve a name outside Loki.
+  stmts.push(
+    `REVOKE ALL ON SCHEMA public FROM ${ro};
+REVOKE ALL ON ALL TABLES    IN SCHEMA public FROM ${ro};
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM ${ro};
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM ${ro};
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES    FROM ${ro};
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM ${ro};
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON FUNCTIONS FROM ${ro};
+`,
+  )
+  stmts.push(
+    `GRANT SELECT ON
+  ${t('tenants')},
+  ${t('accounts')},
+  ${t('txn_records')},
+  ${t('txn_transitions')},
+  ${t('txn_keys')},
+  ${t('postings')},
+  ${t('outbox')},
+  ${t('txn_anomalies')},
+  ${t('txn_scheduled')},
+  ${t('fx_rates')},
+  ${t('txn_holds')},
+  ${t('txn_disputes')}
+TO ${ro};
+`,
+  )
+  // Future tables created by `ledger_admin` (projections, future
+  // engine tables) automatically gain SELECT for the readonly role.
+  stmts.push(
+    `ALTER DEFAULT PRIVILEGES FOR ROLE ${admin} IN SCHEMA public
+  GRANT SELECT ON TABLES TO ${ro};
+`,
+  )
+  // Pin search_path so unqualified names can't resolve to operator
+  // tables in `public` outside Loki's set.
+  stmts.push(
+    `ALTER ROLE ${ro} SET search_path = ${quoteRoleLiteral('public')};
+`,
+  )
+
   return stmts.map(trimSql)
 }
 
 export function buildDropRolesSql(options: ResolvedMigrationOptions): string[] {
   const app = ident(options.appRole)
   const admin = ident(options.adminRole)
+  const ro = ident(options.readonlyRole)
   // We don't `DROP ROLE` because grants on objects still owned by the
   // role would block it. The migration's `down` revokes grants; the
   // role itself is left in place — operators drop it manually if they
@@ -161,6 +216,7 @@ export function buildDropRolesSql(options: ResolvedMigrationOptions): string[] {
     trimSql(
       `REVOKE ALL ON ALL TABLES IN SCHEMA public FROM ${app};
 REVOKE ALL ON ALL TABLES IN SCHEMA public FROM ${admin};
+REVOKE ALL ON ALL TABLES IN SCHEMA public FROM ${ro};
 `,
     ),
   ]

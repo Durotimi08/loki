@@ -8,6 +8,9 @@ import { runTrace } from './commands/trace.js'
 import { type LokiConfig, loadConfig } from './config.js'
 import { type Io, stdIo } from './io.js'
 
+// `commands/dashboard` is loaded lazily — `loki migrate` should not
+// pay the Fastify import cost. See DASHBOARD.md §2 dependency policy.
+
 export type RunnerOptions = {
   readonly args: readonly string[]
   readonly io?: Io
@@ -52,6 +55,13 @@ Commands:
   trace <txnId> --tenant <id> [--verify]
                               Print the full transition trail for a record;
                               --verify recomputes the hash chain.
+
+  dashboard                   Start the read-only dashboard HTTP server.
+                              Loopback-only by default. M1 surface:
+                              /api/v1/health and /api/v1/version.
+                              [--host H] [--port N] [--read-url URL]
+                              [--allow-prod] [--unsafe-host]
+                              [--statement-timeout-ms N] [--pool-max N]
 
 Global flags:
   --config <path>             Path to a loki.config.{js,mjs,ts} module
@@ -98,6 +108,8 @@ export async function run(options: RunnerOptions): Promise<number> {
         return await runAnomaliesCommand(config, rest, io)
       case 'trace':
         return await runTraceCommand(config, rest, io)
+      case 'dashboard':
+        return await runDashboardCommand(config, rest, io)
       default:
         io.err(`Unknown command: ${command ?? '<missing>'}`)
         io.err(HELP)
@@ -386,4 +398,20 @@ async function runTraceCommand(
     },
     io,
   )
+}
+
+async function runDashboardCommand(
+  config: LokiConfig,
+  args: readonly string[],
+  io: Io,
+): Promise<number> {
+  // Lazy-loaded — DASHBOARD.md §2 says the Fastify dep should not be
+  // pulled into the import graph for non-dashboard subcommands.
+  const { parseDashboardArgs, runDashboard } = await import('./commands/dashboard.js')
+  const parsed = parseDashboardArgs(args)
+  if ('error' in parsed) {
+    io.err(parsed.error)
+    return 2
+  }
+  return runDashboard(config, parsed, io)
 }

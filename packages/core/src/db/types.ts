@@ -35,6 +35,13 @@ export type MigrationOptions = {
   /** Postgres role with full access (migrations, reconciler). Default `ledger_admin`. */
   readonly adminRole?: string
   /**
+   * Postgres role for the read-only dashboard pool. Created with SELECT
+   * on Loki's own tables only — `REVOKE ALL` on `public` (and default
+   * privileges); `search_path` pinned to the engine schema. Default
+   * `ledger_readonly`. See DASHBOARD.md §8.10 layer 4.
+   */
+  readonly readonlyRole?: string
+  /**
    * Optional table-name prefix. The eight engine tables become
    * `${prefix}tenants`, `${prefix}txn_records`, etc. Empty by default.
    */
@@ -50,6 +57,7 @@ export type ResolvedMigrationOptions = {
   readonly tenancy: TenancyMode
   readonly appRole: string
   readonly adminRole: string
+  readonly readonlyRole: string
   readonly tablePrefix: string
   readonly partitioning: PartitioningStrategy
 }
@@ -58,6 +66,7 @@ export const DEFAULT_OPTIONS: ResolvedMigrationOptions = {
   tenancy: 'rls',
   appRole: 'ledger_app',
   adminRole: 'ledger_admin',
+  readonlyRole: 'ledger_readonly',
   tablePrefix: '',
   partitioning: 'none',
 }
@@ -87,10 +96,15 @@ export function resolveOptions(options: MigrationOptions = {}): ResolvedMigratio
   if (!SAFE_IDENTIFIER_PART.test(adminRole)) {
     throw new Error(`adminRole "${adminRole}" must match [A-Za-z_][A-Za-z0-9_]*.`)
   }
+  const readonlyRole = options.readonlyRole ?? DEFAULT_OPTIONS.readonlyRole
+  if (!SAFE_IDENTIFIER_PART.test(readonlyRole)) {
+    throw new Error(`readonlyRole "${readonlyRole}" must match [A-Za-z_][A-Za-z0-9_]*.`)
+  }
   return {
     tenancy: options.tenancy ?? DEFAULT_OPTIONS.tenancy,
     appRole,
     adminRole,
+    readonlyRole,
     tablePrefix,
     partitioning: options.partitioning ?? DEFAULT_OPTIONS.partitioning,
   }

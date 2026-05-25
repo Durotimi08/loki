@@ -780,6 +780,52 @@ loki anomalies list --tenant <id> [--severity warn|error|critical] [--unresolved
 loki anomalies resolve <id> --tenant <id> --by <name> --note <text>
 
 loki trace <txnId> --tenant <id> [--verify]
+
+loki dashboard [--port N] [--host H] [--auth bearer:$TOKEN | basic:user:argon2-hash]
+               [--allowed-host <host:port> ...] [--trust-proxy-tls] [--trust-proxy-hops N]
+               [--allow-prod] [--unsafe-host] [--allow-actions] [--open]
+```
+
+---
+
+## Dashboard
+
+A read-only HTTP dashboard ships with `@loki/cli`. Boots in one command, surfaces every tenant / actor / account / transaction / trace / anomaly / outbox / scheduler / hold / dispute / FX series that the engine writes — without ever performing a mutation. Two narrowly-bounded action endpoints (anomaly resolve, on-demand reconciler pass) are opt-in behind `--allow-actions` + per-subject grants + CSRF + idempotency.
+
+```sh
+# Dev default: binds 127.0.0.1:4488, no auth, no redaction
+loki dashboard --open
+
+# Prod-ish (behind a TLS-terminating reverse proxy):
+LOKI_DASHBOARD_TOKEN=$(openssl rand -hex 32)
+loki dashboard \
+  --host 0.0.0.0 --unsafe-host \
+  --allowed-host dashboard.internal:443 \
+  --trust-proxy-tls \
+  --auth bearer:$LOKI_DASHBOARD_TOKEN \
+  --allow-prod
+```
+
+The dashboard is structurally read-only: a dedicated `ReadEngine` facade, a Postgres pool opened with `default_transaction_read_only=on`, and a recommended `ledger_readonly` role (migration creates it). A CI lint script (`scripts/check-dashboard-readonly.ts`) walks the dashboard subtree and fails the build on any forbidden import (write API, `eval`, outbound HTTP, etc.).
+
+Defaults are dev-safe — the server refuses to start on non-loopback hosts, under `NODE_ENV=production`, or with `--allow-actions` unless an auth scheme + (for non-loopback) TLS in front are configured. DNS-rebinding is shut at the door via a Host-header allowlist; same-origin is enforced via `Sec-Fetch-Site`; every response carries a strict CSP, COOP/CORP, `Cache-Control: private, no-store`. See [packages/cli/DASHBOARD.md](packages/cli/DASHBOARD.md) for the full design + threat model.
+
+```ts
+// loki.config.ts
+import schema from './ledger.schema'
+
+export default {
+  schema,
+  connection: { url: process.env.DATABASE_URL },
+  dashboard: {
+    port: 4488,
+    tenants: ['chidori'],
+    auth: { kind: 'bearer', token: process.env.LOKI_DASHBOARD_TOKEN! },
+    allowedHosts: ['dashboard.internal:443'],
+    // Optional payload redactor — runs after engine.decryptPayload.
+    redactPayload: (payload, ctx) => (ctx.kind === 'transition' ? safeProjection(payload) : payload),
+  },
+}
 ```
 
 ---

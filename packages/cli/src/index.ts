@@ -17,20 +17,17 @@ export { runTenant, type TenantAction } from './commands/tenant.js'
 
 // When invoked as a binary (`loki ...`), run the CLI and exit. The
 // guard lets the file be imported as a module without side effects.
+// Build is ESM-only; tsup polyfills `require` via `createRequire`, so
+// `typeof require === 'undefined'` lies — match on `import.meta.url`
+// vs `process.argv[1]` directly.
 const isMain = (() => {
-  if (typeof require === 'undefined') {
-    // ESM
-    try {
-      const url = import.meta.url
-      const argv1 = process.argv[1]
-      if (!argv1) return false
-      return new URL(`file://${argv1}`).href === url
-    } catch {
-      return false
-    }
+  const argv1 = process.argv[1]
+  if (argv1 === undefined) return false
+  try {
+    return new URL(`file://${argv1}`).href === import.meta.url
+  } catch {
+    return false
   }
-  // CJS
-  return require.main === module
 })()
 
 if (isMain) {

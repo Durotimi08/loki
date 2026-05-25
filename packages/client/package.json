@@ -1,6 +1,6 @@
 {
   "name": "@loki/client",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Codegen target for the Loki typed runtime client.",
   "license": "Apache-2.0",
   "type": "module",

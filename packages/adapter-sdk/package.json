@@ -1,6 +1,6 @@
 {
   "name": "@loki/adapter-sdk",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Adapter SDK for bridging Loki to PSPs and banks.",
   "license": "Apache-2.0",
   "type": "module",
